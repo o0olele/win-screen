@@ -1,0 +1,17 @@
+[package]
+name = "win-screen-cli"
+version = "0.1.0"
+description = "Standalone CLI for win-screen."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "win-screen"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+win-screen-core = { path = "../win-screen-core" }

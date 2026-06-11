@@ -1,0 +1,19 @@
+[package]
+name = "win-screen-core"
+version = "0.1.0"
+description = "Windows screenshot, screen recording, and desktop pinning core library."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+arboard.workspace = true
+crossbeam-channel.workspace = true
+image.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true

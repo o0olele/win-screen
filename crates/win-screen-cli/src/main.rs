@@ -1,0 +1,217 @@
+use anyhow::{Context, Result};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use std::io::{self, Read};
+use std::path::PathBuf;
+use win_screen_core::{
+    AudioOptions, CapturedImage, Capturer, InteractiveCaptureOptions, Pin, Recorder,
+    RecordingTarget, Rect, Screenshot,
+};
+
+#[derive(Debug, Parser)]
+#[command(name = "win-screen")]
+#[command(about = "Windows screenshot, recording, and desktop pinning CLI")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    Shot(ShotArgs),
+    Record(RecordArgs),
+    Pin(PinArgs),
+}
+
+#[derive(Debug, Args)]
+struct ShotArgs {
+    #[arg(long, conflicts_with = "fullscreen")]
+    interactive: bool,
+
+    #[arg(long)]
+    fullscreen: bool,
+
+    #[arg(long, conflicts_with_all = ["interactive", "fullscreen", "region", "window"])]
+    monitor: Option<u32>,
+
+    #[arg(long, conflicts_with_all = ["interactive", "fullscreen", "region", "monitor"])]
+    window: Option<String>,
+
+    #[arg(long, value_names = ["X", "Y", "WIDTH", "HEIGHT"], num_args = 4)]
+    region: Option<Vec<i32>>,
+
+    #[arg(long)]
+    save: Option<PathBuf>,
+
+    #[arg(long)]
+    clipboard: bool,
+
+    #[arg(long, help = "Create a desktop pin from the captured image")]
+    pin: bool,
+
+    #[arg(long, help = "Return immediately after creating a pin window")]
+    no_wait: bool,
+}
+
+#[derive(Debug, Args)]
+struct RecordArgs {
+    #[arg(long)]
+    output: PathBuf,
+
+    #[arg(long, value_enum, value_delimiter = ',', default_value = "system")]
+    audio: Vec<AudioSource>,
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+enum AudioSource {
+    System,
+    Mic,
+}
+
+#[derive(Debug, Args)]
+struct PinArgs {
+    #[arg(long)]
+    file: Option<PathBuf>,
+
+    #[arg(long)]
+    clipboard: bool,
+
+    #[arg(long)]
+    list: bool,
+
+    #[arg(long, help = "Return immediately after creating the pin window")]
+    no_wait: bool,
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    win_screen_core::platform::set_process_dpi_aware().ok();
+
+    match cli.command {
+        Command::Shot(args) => shot(args),
+        Command::Record(args) => record(args),
+        Command::Pin(args) => pin(args),
+    }
+}
+
+fn shot(args: ShotArgs) -> Result<()> {
+    let image = if args.interactive {
+        Capturer::interactive(InteractiveCaptureOptions {
+            copy_to_clipboard: args.clipboard,
+            save_path: args.save.clone(),
+            ..Default::default()
+        })?
+        .context("interactive capture was canceled")?
+    } else if let Some(region) = args.region {
+        let rect = Rect::new(
+            region[0],
+            region[1],
+            u32::try_from(region[2]).context("region width must be positive")?,
+            u32::try_from(region[3]).context("region height must be positive")?,
+        )?;
+        Screenshot::capture_region(rect)?
+    } else if let Some(monitor) = args.monitor {
+        Screenshot::capture_monitor(monitor)?
+    } else if let Some(window) = args.window.as_ref() {
+        let hwnd = parse_hwnd(window)?;
+        Screenshot::capture_window(hwnd)?
+    } else {
+        Screenshot::capture_fullscreen()?
+    };
+
+    if let Some(path) = args.save.as_ref() {
+        image
+            .save_png(path)
+            .with_context(|| format!("failed to save {}", path.display()))?;
+        println!("saved {}", path.display());
+    }
+
+    if args.clipboard {
+        image.copy_to_clipboard()?;
+        println!("copied {}x{} image to clipboard", image.width, image.height);
+    }
+
+    if args.pin {
+        let handle = Pin::from_image(image)?;
+        println!("pin created: {}", handle.id());
+        wait_for_pin_if_needed(&handle, args.no_wait)?;
+        return Ok(());
+    }
+
+    if !args.clipboard && args.save.is_none() {
+        println!("captured {}x{} image", image.width, image.height);
+    }
+
+    Ok(())
+}
+
+fn record(args: RecordArgs) -> Result<()> {
+    let audio = AudioOptions {
+        system: args
+            .audio
+            .iter()
+            .any(|source| matches!(source, AudioSource::System)),
+        microphone: args
+            .audio
+            .iter()
+            .any(|source| matches!(source, AudioSource::Mic)),
+    };
+
+    let handle = Recorder::builder()
+        .target(RecordingTarget::Fullscreen)
+        .audio(audio)
+        .output(args.output)
+        .start()?;
+    println!("recording started: {}", handle.id());
+    Ok(())
+}
+
+fn pin(args: PinArgs) -> Result<()> {
+    if args.list {
+        for pin in Pin::list()? {
+            println!("pin {}: {}x{}", pin.id, pin.size.width, pin.size.height);
+        }
+        return Ok(());
+    }
+
+    if let Some(path) = args.file {
+        let image = CapturedImage::load(&path)
+            .with_context(|| format!("failed to load {}", path.display()))?;
+        let handle = Pin::from_image(image)?;
+        println!("pin created: {}", handle.id());
+        wait_for_pin_if_needed(&handle, args.no_wait)?;
+        return Ok(());
+    }
+
+    if args.clipboard {
+        let handle = Pin::from_clipboard()?;
+        println!("pin created: {}", handle.id());
+        wait_for_pin_if_needed(&handle, args.no_wait)?;
+        return Ok(());
+    }
+
+    anyhow::bail!("pass --clipboard or --file")
+}
+
+fn wait_for_pin_if_needed(handle: &win_screen_core::PinHandle, no_wait: bool) -> Result<()> {
+    if no_wait {
+        return Ok(());
+    }
+
+    println!("press Enter to close pin");
+    let mut one = [0_u8; 1];
+    let _ = io::stdin().read(&mut one)?;
+    handle.close()?;
+    Ok(())
+}
+
+fn parse_hwnd(value: &str) -> Result<isize> {
+    let trimmed = value.trim();
+    if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
+        isize::from_str_radix(hex, 16).context("invalid hex HWND")
+    } else {
+        trimmed.parse::<isize>().context("invalid HWND")
+    }
+}

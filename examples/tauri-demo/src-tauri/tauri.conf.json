@@ -1,0 +1,21 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "win-screen-tauri-demo",
+  "version": "0.1.0",
+  "identifier": "local.win-screen.demo",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "",
+    "beforeBuildCommand": ""
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "win-screen demo",
+        "width": 900,
+        "height": 600
+      }
+    ]
+  }
+}
