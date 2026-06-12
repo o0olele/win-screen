@@ -39,6 +39,15 @@ await invoke("plugin:win-screen|pin_image", {
 });
 
 const pins = await invoke("plugin:win-screen|list_pins");
+
+await invoke("plugin:win-screen|set_pin_opacity", {
+  options: { id: 1, opacity: 0.75 },
+});
+
+await invoke("plugin:win-screen|copy_pin", { id: 1 });
+await invoke("plugin:win-screen|save_pin", {
+  options: { id: 1, path: "pin.png" },
+});
 ```
 
 Capture a specific monitor or native window:
@@ -51,4 +60,7 @@ await invoke("plugin:win-screen|capture_monitor", {
 await invoke("plugin:win-screen|capture_window_to_pin", {
   options: { hwnd: 123456 },
 });
+
+const monitors = await invoke("plugin:win-screen|list_monitors");
+const windows = await invoke("plugin:win-screen|list_windows");
 ```
