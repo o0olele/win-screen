@@ -1,0 +1,2 @@
+description = "Allows pin_image."
+commands.allow = ["pin_image"]

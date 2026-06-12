@@ -1,0 +1,2 @@
+description = "Allows capture_window_to_pin."
+commands.allow = ["capture_window_to_pin"]

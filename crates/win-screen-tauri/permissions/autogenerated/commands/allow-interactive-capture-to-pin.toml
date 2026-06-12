@@ -1,0 +1,2 @@
+description = "Allows interactive_capture_to_pin."
+commands.allow = ["interactive_capture_to_pin"]

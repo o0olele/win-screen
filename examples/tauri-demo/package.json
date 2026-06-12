@@ -1,0 +1,20 @@
+{
+  "name": "win-screen-tauri-demo",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "postinstall": "node scripts/write-icon.cjs",
+    "dev": "vite --host 127.0.0.1 --port 1420",
+    "build": "node scripts/write-icon.cjs && tsc && vite build",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.0.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0",
+    "typescript": "^5.5.0",
+    "vite": "^5.4.0"
+  }
+}

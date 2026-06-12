@@ -1,16 +1,23 @@
-use crate::{CapturedImage, Rect, Result, WinScreenError};
+use crate::{CapturedImage, MonitorInfo, Rect, Result, WinScreenError, WindowInfo};
 use std::ffi::c_void;
 use std::mem::size_of;
 use std::ptr::null_mut;
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
+use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject,
-    EnumDisplayMonitors, GetDIBits, GetMonitorInfoW, GetWindowDC, MonitorFromWindow, SelectObject,
-    BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CAPTUREBLT, DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ,
-    HMONITOR, MONITORINFO, MONITOR_DEFAULTTONEAREST, SRCCOPY,
+    EnumDisplayMonitors, GetDIBits, GetMonitorInfoW, GetWindowDC, SelectObject, BITMAPINFO,
+    BITMAPINFOHEADER, BI_RGB, CAPTUREBLT, DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ, HMONITOR,
+    MONITORINFO, SRCCOPY,
 };
+
+#[link(name = "user32")]
+extern "system" {
+    fn PrintWindow(hwnd: HWND, hdc: HDC, nflags: u32) -> BOOL;
+}
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetDesktopWindow, GetSystemMetrics, GetWindowRect, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+    EnumWindows, GetDesktopWindow, GetSystemMetrics, GetWindowRect, GetWindowTextLengthW,
+    GetWindowTextW, IsIconic, IsWindowVisible, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
     SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
 };
 
@@ -158,14 +165,7 @@ pub fn capture_monitor(id: u32) -> Result<CapturedImage> {
 
 pub fn capture_window(hwnd: isize) -> Result<CapturedImage> {
     let hwnd = HWND(hwnd as *mut c_void);
-    let mut rect = RECT::default();
-    let ok = unsafe { GetWindowRect(hwnd, &mut rect) };
-    if ok.is_err() {
-        return Err(WinScreenError::NotImplemented {
-            feature: "GetWindowRect failure mapping",
-        });
-    }
-
+    let rect = window_bounds(hwnd)?;
     let width = u32::try_from(rect.right - rect.left).map_err(|_| {
         WinScreenError::InvalidRect(Rect {
             x: rect.left,
@@ -182,7 +182,128 @@ pub fn capture_window(hwnd: isize) -> Result<CapturedImage> {
             height: 0,
         })
     })?;
+
+    if let Ok(image) = print_window(hwnd, width, height) {
+        return Ok(image);
+    }
+
     capture_region(Rect::new(rect.left, rect.top, width, height)?)
+}
+
+pub fn list_monitors() -> Result<Vec<MonitorInfo>> {
+    Ok(enumerate_monitor_infos()?)
+}
+
+pub fn list_windows() -> Result<Vec<WindowInfo>> {
+    unsafe extern "system" fn enum_proc(hwnd: HWND, data: LPARAM) -> BOOL {
+        let windows = &mut *(data.0 as *mut Vec<WindowInfo>);
+        if !IsWindowVisible(hwnd).as_bool() {
+            return BOOL(1);
+        }
+        if IsIconic(hwnd).as_bool() {
+            return BOOL(1);
+        }
+
+        let title_len = GetWindowTextLengthW(hwnd);
+        if title_len <= 0 {
+            return BOOL(1);
+        }
+
+        let mut title = vec![0_u16; title_len as usize + 1];
+        let copied = GetWindowTextW(hwnd, &mut title);
+        if copied <= 0 {
+            return BOOL(1);
+        }
+        title.truncate(copied as usize);
+        let title = String::from_utf16_lossy(&title).trim().to_string();
+        if title.is_empty() {
+            return BOOL(1);
+        }
+
+        let Ok(rect) = window_bounds(hwnd) else {
+            return BOOL(1);
+        };
+
+        let width = rect.right - rect.left;
+        let height = rect.bottom - rect.top;
+        if width <= 0 || height <= 0 {
+            return BOOL(1);
+        }
+        if !rect_intersects_virtual_screen(rect) {
+            return BOOL(1);
+        }
+
+        windows.push(WindowInfo {
+            hwnd: hwnd.0 as isize,
+            title,
+            rect: Rect {
+                x: rect.left,
+                y: rect.top,
+                width: width as u32,
+                height: height as u32,
+            },
+        });
+
+        BOOL(1)
+    }
+
+    let mut windows = Vec::new();
+    unsafe {
+        EnumWindows(
+            Some(enum_proc),
+            LPARAM((&mut windows as *mut Vec<WindowInfo>) as isize),
+        )?;
+    }
+    Ok(windows)
+}
+
+fn print_window(hwnd: HWND, width: u32, height: u32) -> Result<CapturedImage> {
+    let width_i32 = i32::try_from(width).map_err(|_| WinScreenError::ImageTooLarge)?;
+    let height_i32 = i32::try_from(height).map_err(|_| WinScreenError::ImageTooLarge)?;
+
+    let window_dc = ScreenDc::new(hwnd)?;
+    let mem_dc = MemDc::new(window_dc.hdc)?;
+    let bitmap = Bitmap::new(window_dc.hdc, width_i32, height_i32)?;
+    let _selected = SelectedObject::new(mem_dc.0, bitmap.0)?;
+
+    let printed = unsafe { PrintWindow(hwnd, mem_dc.0, 0) };
+    if !printed.as_bool() {
+        return Err(WinScreenError::NotImplemented {
+            feature: "PrintWindow returned false",
+        });
+    }
+
+    bitmap_to_rgba(window_dc.hdc, bitmap.0, width, height)
+}
+
+fn window_bounds(hwnd: HWND) -> Result<RECT> {
+    let mut rect = RECT::default();
+    let dwm = unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            &mut rect as *mut RECT as *mut c_void,
+            size_of::<RECT>() as u32,
+        )
+    };
+    if dwm.is_ok() && rect.right > rect.left && rect.bottom > rect.top {
+        return Ok(rect);
+    }
+
+    unsafe { GetWindowRect(hwnd, &mut rect) }.map_err(|_| WinScreenError::NotImplemented {
+        feature: "GetWindowRect failure mapping",
+    })?;
+    Ok(rect)
+}
+
+fn rect_intersects_virtual_screen(rect: RECT) -> bool {
+    let screen = virtual_screen_rect();
+    let screen_right = screen.x + screen.width as i32;
+    let screen_bottom = screen.y + screen.height as i32;
+    rect.left < screen_right
+        && rect.right > screen.x
+        && rect.top < screen_bottom
+        && rect.bottom > screen.y
 }
 
 fn virtual_screen_rect() -> Rect {
@@ -244,25 +365,37 @@ fn bitmap_to_rgba(dc: HDC, bitmap: HBITMAP, width: u32, height: u32) -> Result<C
 }
 
 fn enumerate_monitors() -> Result<Vec<Rect>> {
+    Ok(enumerate_monitor_infos()?
+        .into_iter()
+        .map(|monitor| monitor.rect)
+        .collect())
+}
+
+fn enumerate_monitor_infos() -> Result<Vec<MonitorInfo>> {
     unsafe extern "system" fn enum_proc(
         monitor: HMONITOR,
         _dc: HDC,
         _rect: *mut RECT,
         data: LPARAM,
     ) -> BOOL {
-        let monitors = &mut *(data.0 as *mut Vec<Rect>);
+        let monitors = &mut *(data.0 as *mut Vec<MonitorInfo>);
         let mut info = MONITORINFO {
             cbSize: size_of::<MONITORINFO>() as u32,
             ..Default::default()
         };
         if GetMonitorInfoW(monitor, &mut info).as_bool() {
+            let id = monitors.len() as u32;
             let width = (info.rcMonitor.right - info.rcMonitor.left).max(0) as u32;
             let height = (info.rcMonitor.bottom - info.rcMonitor.top).max(0) as u32;
-            monitors.push(Rect {
-                x: info.rcMonitor.left,
-                y: info.rcMonitor.top,
-                width,
-                height,
+            monitors.push(MonitorInfo {
+                id,
+                primary: (info.dwFlags & 1) != 0,
+                rect: Rect {
+                    x: info.rcMonitor.left,
+                    y: info.rcMonitor.top,
+                    width,
+                    height,
+                },
             });
         }
         BOOL(1)
@@ -274,24 +407,15 @@ fn enumerate_monitors() -> Result<Vec<Rect>> {
             HDC(null_mut()),
             None,
             Some(enum_proc),
-            LPARAM((&mut monitors as *mut Vec<Rect>) as isize),
+            LPARAM((&mut monitors as *mut Vec<MonitorInfo>) as isize),
         )
     };
-    if !ok.as_bool() {
-        let desktop = unsafe { GetDesktopWindow() };
-        let monitor = unsafe { MonitorFromWindow(desktop, MONITOR_DEFAULTTONEAREST) };
-        let mut info = MONITORINFO {
-            cbSize: size_of::<MONITORINFO>() as u32,
-            ..Default::default()
-        };
-        if unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
-            monitors.push(Rect {
-                x: info.rcMonitor.left,
-                y: info.rcMonitor.top,
-                width: (info.rcMonitor.right - info.rcMonitor.left) as u32,
-                height: (info.rcMonitor.bottom - info.rcMonitor.top) as u32,
-            });
-        }
+    if !ok.as_bool() || monitors.is_empty() {
+        monitors.push(MonitorInfo {
+            id: 0,
+            primary: true,
+            rect: virtual_screen_rect(),
+        });
     }
     Ok(monitors)
 }

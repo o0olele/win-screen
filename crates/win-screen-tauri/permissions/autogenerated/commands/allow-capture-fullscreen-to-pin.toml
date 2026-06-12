@@ -1,0 +1,2 @@
+description = "Allows capture_fullscreen_to_pin."
+commands.allow = ["capture_fullscreen_to_pin"]

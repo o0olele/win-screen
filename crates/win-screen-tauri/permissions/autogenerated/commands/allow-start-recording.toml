@@ -1,0 +1,2 @@
+description = "Allows start_recording."
+commands.allow = ["start_recording"]

@@ -1,0 +1,2 @@
+description = "Allows pin_from_clipboard."
+commands.allow = ["pin_from_clipboard"]

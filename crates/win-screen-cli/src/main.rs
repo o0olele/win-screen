@@ -20,6 +20,8 @@ enum Command {
     Shot(ShotArgs),
     Record(RecordArgs),
     Pin(PinArgs),
+    ListMonitors,
+    ListWindows,
 }
 
 #[derive(Debug, Args)]
@@ -44,6 +46,12 @@ struct ShotArgs {
 
     #[arg(long)]
     clipboard: bool,
+
+    #[arg(long, help = "Open the annotation editor after an interactive capture")]
+    annotate: bool,
+
+    #[arg(long, help = "Skip the annotation editor for interactive captures")]
+    no_annotate: bool,
 
     #[arg(long, help = "Create a desktop pin from the captured image")]
     pin: bool,
@@ -78,6 +86,21 @@ struct PinArgs {
     #[arg(long)]
     list: bool,
 
+    #[arg(long)]
+    copy: Option<u64>,
+
+    #[arg(long)]
+    save: Option<u64>,
+
+    #[arg(long)]
+    output: Option<PathBuf>,
+
+    #[arg(long)]
+    opacity: Option<u64>,
+
+    #[arg(long)]
+    value: Option<f32>,
+
     #[arg(long, help = "Return immediately after creating the pin window")]
     no_wait: bool,
 }
@@ -90,17 +113,23 @@ fn main() -> Result<()> {
         Command::Shot(args) => shot(args),
         Command::Record(args) => record(args),
         Command::Pin(args) => pin(args),
+        Command::ListMonitors => list_monitors(),
+        Command::ListWindows => list_windows(),
     }
 }
 
 fn shot(args: ShotArgs) -> Result<()> {
+    let mut pin_requested = args.pin;
     let image = if args.interactive {
-        Capturer::interactive(InteractiveCaptureOptions {
+        let annotate = args.annotate && !args.no_annotate;
+        let result = Capturer::interactive_with_result(InteractiveCaptureOptions {
+            annotate,
             copy_to_clipboard: args.clipboard,
             save_path: args.save.clone(),
-            ..Default::default()
         })?
-        .context("interactive capture was canceled")?
+        .context("interactive capture was canceled")?;
+        pin_requested |= result.pin_requested;
+        result.image
     } else if let Some(region) = args.region {
         let rect = Rect::new(
             region[0],
@@ -130,7 +159,7 @@ fn shot(args: ShotArgs) -> Result<()> {
         println!("copied {}x{} image to clipboard", image.width, image.height);
     }
 
-    if args.pin {
+    if pin_requested {
         let handle = Pin::from_image(image)?;
         println!("pin created: {}", handle.id());
         wait_for_pin_if_needed(&handle, args.no_wait)?;
@@ -168,8 +197,40 @@ fn record(args: RecordArgs) -> Result<()> {
 fn pin(args: PinArgs) -> Result<()> {
     if args.list {
         for pin in Pin::list()? {
-            println!("pin {}: {}x{}", pin.id, pin.size.width, pin.size.height);
+            println!(
+                "pin {}: image={}x{} window={}x{} at {},{} opacity={:.0}%",
+                pin.id,
+                pin.size.width,
+                pin.size.height,
+                pin.display_size.width,
+                pin.display_size.height,
+                pin.position.x,
+                pin.position.y,
+                pin.opacity * 100.0
+            );
         }
+        return Ok(());
+    }
+
+    if let Some(id) = args.copy {
+        Pin::copy(id)?;
+        println!("copied pin {id} to clipboard");
+        return Ok(());
+    }
+
+    if let Some(id) = args.save {
+        let output = args.output.context("pin --save requires --output <PATH>")?;
+        Pin::save_png(id, &output)?;
+        println!("saved pin {id} to {}", output.display());
+        return Ok(());
+    }
+
+    if let Some(id) = args.opacity {
+        let value = args
+            .value
+            .context("pin --opacity requires --value <0.1..1.0>")?;
+        win_screen_core::pin::set_pin_opacity(id, value)?;
+        println!("set pin {id} opacity to {value}");
         return Ok(());
     }
 
@@ -214,4 +275,35 @@ fn parse_hwnd(value: &str) -> Result<isize> {
     } else {
         trimmed.parse::<isize>().context("invalid HWND")
     }
+}
+
+fn list_monitors() -> Result<()> {
+    for monitor in Screenshot::monitors()? {
+        let primary = if monitor.primary { " primary" } else { "" };
+        println!(
+            "{}:{} x={} y={} w={} h={}",
+            monitor.id,
+            primary,
+            monitor.rect.x,
+            monitor.rect.y,
+            monitor.rect.width,
+            monitor.rect.height
+        );
+    }
+    Ok(())
+}
+
+fn list_windows() -> Result<()> {
+    for window in Screenshot::windows()? {
+        println!(
+            "0x{:X} x={} y={} w={} h={} {}",
+            window.hwnd,
+            window.rect.x,
+            window.rect.y,
+            window.rect.width,
+            window.rect.height,
+            window.title
+        );
+    }
+    Ok(())
 }

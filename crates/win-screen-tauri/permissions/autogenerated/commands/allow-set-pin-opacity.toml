@@ -1,0 +1,2 @@
+description = "Allows set_pin_opacity."
+commands.allow = ["set_pin_opacity"]

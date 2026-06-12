@@ -1,0 +1,2 @@
+description = "Allows copy_pin."
+commands.allow = ["copy_pin"]

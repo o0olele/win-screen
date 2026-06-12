@@ -1,0 +1,9 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Default permissions for the win-screen demo window.",
+  "windows": ["main", "capture-toolbar"],
+  "permissions": [
+    "core:default"
+  ]
+}

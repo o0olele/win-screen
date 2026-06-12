@@ -1,0 +1,2 @@
+description = "Allows list_windows."
+commands.allow = ["list_windows"]

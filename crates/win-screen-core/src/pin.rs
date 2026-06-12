@@ -1,4 +1,5 @@
 use crate::{CapturedImage, PinHandle, PinInfo, Result};
+use std::path::Path;
 
 #[cfg(windows)]
 mod windows_pin;
@@ -54,6 +55,34 @@ pub fn list_pins() -> Result<Vec<PinInfo>> {
     #[cfg(not(windows))]
     {
         use crate::WinScreenError;
+        Err(WinScreenError::UnsupportedPlatform)
+    }
+}
+
+pub fn copy_pin(id: u64) -> Result<()> {
+    #[cfg(windows)]
+    {
+        return windows_pin::copy_pin(id);
+    }
+
+    #[cfg(not(windows))]
+    {
+        use crate::WinScreenError;
+        let _ = id;
+        Err(WinScreenError::UnsupportedPlatform)
+    }
+}
+
+pub fn save_pin(id: u64, path: &Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        return windows_pin::save_pin(id, path);
+    }
+
+    #[cfg(not(windows))]
+    {
+        use crate::WinScreenError;
+        let _ = (id, path);
         Err(WinScreenError::UnsupportedPlatform)
     }
 }

@@ -1,4 +1,4 @@
-use crate::{CapturedImage, Rect, Result, WinScreenError};
+use crate::{CapturedImage, MonitorInfo, Rect, Result, WinScreenError, WindowInfo};
 
 #[cfg(windows)]
 mod windows_gdi;
@@ -53,6 +53,30 @@ pub fn capture_window(hwnd: isize) -> Result<CapturedImage> {
     #[cfg(not(windows))]
     {
         let _ = hwnd;
+        Err(WinScreenError::UnsupportedPlatform)
+    }
+}
+
+pub fn list_monitors() -> Result<Vec<MonitorInfo>> {
+    #[cfg(windows)]
+    {
+        return windows_gdi::list_monitors();
+    }
+
+    #[cfg(not(windows))]
+    {
+        Err(WinScreenError::UnsupportedPlatform)
+    }
+}
+
+pub fn list_windows() -> Result<Vec<WindowInfo>> {
+    #[cfg(windows)]
+    {
+        return windows_gdi::list_windows();
+    }
+
+    #[cfg(not(windows))]
+    {
         Err(WinScreenError::UnsupportedPlatform)
     }
 }

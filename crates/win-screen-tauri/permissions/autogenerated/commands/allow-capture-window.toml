@@ -1,0 +1,2 @@
+description = "Allows capture_window."
+commands.allow = ["capture_window"]

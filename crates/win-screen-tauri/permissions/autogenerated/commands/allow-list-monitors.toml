@@ -1,0 +1,2 @@
+description = "Allows list_monitors."
+commands.allow = ["list_monitors"]

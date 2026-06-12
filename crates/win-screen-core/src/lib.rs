@@ -11,8 +11,8 @@ pub mod platform;
 pub mod record;
 
 pub use api::{
-    AudioOptions, CapturedImage, Capturer, InteractiveCaptureOptions, Pin, PinHandle, PinInfo,
-    Recorder, RecordingHandle, RecordingOptions, RecordingTarget, Rect, Screenshot, Size,
-    WinScreenEvent,
+    AudioOptions, CapturedImage, Capturer, InteractiveCaptureOptions, MonitorInfo, Pin, PinHandle,
+    PinInfo, Recorder, RecordingHandle, RecordingOptions, RecordingTarget, Rect, Screenshot, Size,
+    WinScreenEvent, WindowInfo,
 };
 pub use error::{Result, WinScreenError};

@@ -8,8 +8,13 @@ name = "win_screen_tauri_demo_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [dependencies]
-tauri = { version = "2" }
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+serde = { version = "1", features = ["derive"] }
+tauri = { version = "2", features = [] }
+win-screen-core = { path = "../../../crates/win-screen-core" }
 win-screen-tauri = { path = "../../../crates/win-screen-tauri" }
+crossbeam-channel = "0.5"
 
 [build-dependencies]
-tauri-build = { version = "2" }
+tauri-build = { version = "2", features = [] }

@@ -1,0 +1,2 @@
+description = "Allows list_pins."
+commands.allow = ["list_pins"]

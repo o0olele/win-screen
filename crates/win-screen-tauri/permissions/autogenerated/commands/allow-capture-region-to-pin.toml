@@ -1,0 +1,2 @@
+description = "Allows capture_region_to_pin."
+commands.allow = ["capture_region_to_pin"]

@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tauri::{plugin::TauriPlugin, AppHandle, Emitter, Runtime};
 use win_screen_core::{
-    AudioOptions, CapturedImage, Capturer, InteractiveCaptureOptions, Pin, PinInfo, Recorder,
-    RecordingTarget, Rect, Screenshot,
+    AudioOptions, CapturedImage, Capturer, InteractiveCaptureOptions, MonitorInfo, Pin, PinInfo,
+    Recorder, RecordingTarget, Rect, Screenshot, WindowInfo,
 };
 
 pub const EVENT_CAPTURE_DONE: &str = "win-screen://capture-done";
@@ -17,6 +17,15 @@ pub struct CaptureResponse {
     pub width: u32,
     pub height: u32,
     pub path: Option<PathBuf>,
+    pub base64_png: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InteractiveSelectionResponse {
+    pub rect: Rect,
+    pub width: u32,
+    pub height: u32,
     pub base64_png: Option<String>,
 }
 
@@ -83,6 +92,20 @@ pub struct PinResponse {
 pub struct PinImageOptions {
     pub path: Option<PathBuf>,
     pub base64_image: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavePinOptions {
+    pub id: u64,
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PinOpacityOptions {
+    pub id: u64,
+    pub opacity: f32,
 }
 
 pub mod commands {
@@ -156,6 +179,16 @@ pub mod commands {
     }
 
     #[tauri::command]
+    pub fn list_monitors() -> Result<Vec<MonitorInfo>, String> {
+        Screenshot::monitors().map_err(|err| err.to_string())
+    }
+
+    #[tauri::command]
+    pub fn list_windows() -> Result<Vec<WindowInfo>, String> {
+        Screenshot::windows().map_err(|err| err.to_string())
+    }
+
+    #[tauri::command]
     pub fn capture_fullscreen_to_pin() -> Result<PinResponse, String> {
         let image = Screenshot::capture_fullscreen().map_err(|err| err.to_string())?;
         let handle = Pin::from_image(image).map_err(|err| err.to_string())?;
@@ -187,8 +220,8 @@ pub mod commands {
 
     #[tauri::command]
     pub fn interactive_capture_to_pin() -> Result<Option<PinResponse>, String> {
-        let Some(image) = Capturer::interactive(InteractiveCaptureOptions {
-            annotate: false,
+        let Some(result) = Capturer::interactive_with_result(InteractiveCaptureOptions {
+            annotate: true,
             copy_to_clipboard: false,
             save_path: None,
         })
@@ -197,7 +230,11 @@ pub mod commands {
             return Ok(None);
         };
 
-        let handle = Pin::from_image(image).map_err(|err| err.to_string())?;
+        if !result.pin_requested {
+            return Ok(None);
+        }
+
+        let handle = Pin::from_image(result.image).map_err(|err| err.to_string())?;
         Ok(Some(PinResponse { id: handle.id() }))
     }
 
@@ -231,6 +268,30 @@ pub mod commands {
             .map(Some),
             None => Ok(None),
         }
+    }
+
+    #[tauri::command]
+    pub fn select_interactive_capture(
+        inline_base64: Option<bool>,
+    ) -> Result<Option<InteractiveSelectionResponse>, String> {
+        let Some((rect, image)) = win_screen_core::overlay::interactive_capture_selection()
+            .map_err(|err| err.to_string())?
+        else {
+            return Ok(None);
+        };
+
+        let base64_png = if inline_base64.unwrap_or(true) {
+            Some(encode_png_base64(&image)?)
+        } else {
+            None
+        };
+
+        Ok(Some(InteractiveSelectionResponse {
+            rect,
+            width: image.width,
+            height: image.height,
+            base64_png,
+        }))
     }
 
     #[tauri::command]
@@ -288,6 +349,22 @@ pub mod commands {
     }
 
     #[tauri::command]
+    pub fn copy_pin(id: u64) -> Result<(), String> {
+        Pin::copy(id).map_err(|err| err.to_string())
+    }
+
+    #[tauri::command]
+    pub fn save_pin(options: SavePinOptions) -> Result<(), String> {
+        Pin::save_png(options.id, options.path).map_err(|err| err.to_string())
+    }
+
+    #[tauri::command]
+    pub fn set_pin_opacity(options: PinOpacityOptions) -> Result<(), String> {
+        win_screen_core::pin::set_pin_opacity(options.id, options.opacity)
+            .map_err(|err| err.to_string())
+    }
+
+    #[tauri::command]
     pub fn close_pin(id: u64) -> Result<(), String> {
         win_screen_core::pin::close_pin(id).map_err(|err| err.to_string())
     }
@@ -300,17 +377,23 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
             commands::capture_region,
             commands::capture_monitor,
             commands::capture_window,
+            commands::list_monitors,
+            commands::list_windows,
             commands::capture_fullscreen_to_pin,
             commands::capture_region_to_pin,
             commands::capture_monitor_to_pin,
             commands::capture_window_to_pin,
             commands::interactive_capture_to_pin,
             commands::start_interactive_capture,
+            commands::select_interactive_capture,
             commands::start_recording,
             commands::stop_recording,
             commands::pin_image,
             commands::pin_from_clipboard,
             commands::list_pins,
+            commands::copy_pin,
+            commands::save_pin,
+            commands::set_pin_opacity,
             commands::close_pin
         ])
         .build()
@@ -330,16 +413,7 @@ fn finish_capture<R: Runtime>(
     }
 
     let base64_png = if options.inline_base64.unwrap_or(false) {
-        let mut png = Vec::new();
-        image::codecs::png::PngEncoder::new(&mut png)
-            .write_image(
-                &image.rgba,
-                image.width,
-                image.height,
-                image::ColorType::Rgba8.into(),
-            )
-            .map_err(|err| err.to_string())?;
-        Some(base64::engine::general_purpose::STANDARD.encode(png))
+        Some(encode_png_base64(&image)?)
     } else {
         None
     };
@@ -352,4 +426,17 @@ fn finish_capture<R: Runtime>(
     };
     let _ = app.emit(EVENT_CAPTURE_DONE, &response);
     Ok(response)
+}
+
+fn encode_png_base64(image: &win_screen_core::CapturedImage) -> Result<String, String> {
+    let mut png = Vec::new();
+    image::codecs::png::PngEncoder::new(&mut png)
+        .write_image(
+            &image.rgba,
+            image.width,
+            image.height,
+            image::ColorType::Rgba8.into(),
+        )
+        .map_err(|err| err.to_string())?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(png))
 }

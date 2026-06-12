@@ -1,0 +1,2 @@
+description = "Allows close_pin."
+commands.allow = ["close_pin"]

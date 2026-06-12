@@ -1,66 +1,34 @@
 # win-screen Tauri Demo
 
-Minimal integration sketch for the `win-screen-tauri` plugin.
+Manual test app for the `win-screen-tauri` plugin.
 
-Register the plugin in a Tauri v2 application:
+The demo uses the intended split flow:
 
-```rust
-tauri::Builder::default()
-    .plugin(win_screen_tauri::init())
-    .run(tauri::generate_context!())
-    .expect("failed to run tauri app");
+1. Native Win32 overlay selects a region.
+2. The plugin returns the selected image and screen rect to the Web UI.
+3. The Web UI shows preview controls.
+4. Clicking `Pin` calls the native pin command.
+
+## Run
+
+```powershell
+cd examples/tauri-demo
+npm install
+npm run tauri dev
 ```
 
-Frontend commands:
+## Test Flow
 
-```ts
-import { invoke } from "@tauri-apps/api/core";
+- Click `Select Region`.
+- Drag a region in the native overlay.
+- The selected image appears in the Tauri Web UI.
+- Click `Pin` to create a native desktop pin.
+- Use `Refresh`, `100%`, `70%`, and `Close` to test pin state commands.
 
-const capture = await invoke("plugin:win-screen|capture_fullscreen", {
-  options: {
-    savePath: "capture.png",
-    clipboard: true,
-    inlineBase64: false,
-  },
-});
-```
+## Plugin Commands Used
 
-Create a pin directly from a capture:
-
-```ts
-await invoke("plugin:win-screen|interactive_capture_to_pin");
-```
-
-Pin an existing image file and list active native pins:
-
-```ts
-await invoke("plugin:win-screen|pin_image", {
-  options: { path: "capture.png" },
-});
-
-const pins = await invoke("plugin:win-screen|list_pins");
-
-await invoke("plugin:win-screen|set_pin_opacity", {
-  options: { id: 1, opacity: 0.75 },
-});
-
-await invoke("plugin:win-screen|copy_pin", { id: 1 });
-await invoke("plugin:win-screen|save_pin", {
-  options: { id: 1, path: "pin.png" },
-});
-```
-
-Capture a specific monitor or native window:
-
-```ts
-await invoke("plugin:win-screen|capture_monitor", {
-  options: { monitor: 0, savePath: "monitor.png" },
-});
-
-await invoke("plugin:win-screen|capture_window_to_pin", {
-  options: { hwnd: 123456 },
-});
-
-const monitors = await invoke("plugin:win-screen|list_monitors");
-const windows = await invoke("plugin:win-screen|list_windows");
-```
+- `select_interactive_capture`
+- `pin_image`
+- `list_pins`
+- `set_pin_opacity`
+- `close_pin`

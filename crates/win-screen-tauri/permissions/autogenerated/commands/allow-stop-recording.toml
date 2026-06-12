@@ -1,0 +1,2 @@
+description = "Allows stop_recording."
+commands.allow = ["stop_recording"]

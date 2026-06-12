@@ -1,0 +1,2 @@
+description = "Allows save_pin."
+commands.allow = ["save_pin"]

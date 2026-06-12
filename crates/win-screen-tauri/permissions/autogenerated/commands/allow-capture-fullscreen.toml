@@ -1,0 +1,2 @@
+description = "Allows capture_fullscreen."
+commands.allow = ["capture_fullscreen"]

@@ -1,6 +1,9 @@
-use crate::{platform, CapturedImage, PinHandle, PinInfo, Result, Size, WinScreenError};
+use crate::{
+    io, platform, CapturedImage, PinHandle, PinInfo, Rect as ApiRect, Result, Size, WinScreenError,
+};
 use std::collections::HashMap;
 use std::mem::size_of;
+use std::path::Path;
 use std::ptr::null_mut;
 use std::sync::{Mutex, OnceLock};
 use std::thread;
@@ -16,21 +19,29 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetMessageW,
-    GetWindowLongPtrW, LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassW,
+    GetWindowLongPtrW, GetWindowRect, LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassW,
     SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage,
-    CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HTCAPTION, IDC_ARROW, LWA_ALPHA, MSG,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SW_SHOW, WM_APP, WM_DESTROY, WM_LBUTTONDBLCLK,
-    WM_LBUTTONDOWN, WM_MOUSEWHEEL, WM_NCLBUTTONDOWN, WM_PAINT, WM_RBUTTONDOWN, WNDCLASSW,
+    CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT,
+    HTCAPTION, HTCLIENT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, IDC_ARROW, LWA_ALPHA, MSG,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOW, WINDOWPOS, WM_APP, WM_DESTROY,
+    WM_EXITSIZEMOVE, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_MOUSEWHEEL, WM_NCHITTEST,
+    WM_NCLBUTTONDOWN, WM_PAINT, WM_RBUTTONDOWN, WM_SIZE, WM_WINDOWPOSCHANGING, WNDCLASSW,
     WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
 };
 
 const CLASS_NAME: &str = "WinScreenPinWindow";
 const WM_PIN_SET_OPACITY: u32 = WM_APP + 1;
+const WM_PIN_CLOSE: u32 = WM_APP + 2;
+const RESIZE_BORDER: i32 = 8;
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct PinEntry {
     hwnd: HWND,
     size: Size,
+    position: ApiRect,
+    display_size: Size,
+    opacity: f32,
+    image: CapturedImage,
 }
 
 unsafe impl Send for PinEntry {}
@@ -85,7 +96,7 @@ pub fn close_pin(id: u64) -> Result<()> {
     };
 
     unsafe {
-        PostMessageW(entry.hwnd, WM_RBUTTONDOWN, WPARAM(0), LPARAM(0))?;
+        PostMessageW(entry.hwnd, WM_PIN_CLOSE, WPARAM(0), LPARAM(0))?;
     }
     Ok(())
 }
@@ -95,7 +106,7 @@ pub fn set_pin_opacity(id: u64, opacity: f32) -> Result<()> {
         .lock()
         .expect("pin registry poisoned")
         .get(&id)
-        .copied()
+        .cloned()
         .ok_or(WinScreenError::NotImplemented {
             feature: "pin handle not found",
         })?;
@@ -115,8 +126,35 @@ pub fn list_pins() -> Result<Vec<PinInfo>> {
         .map(|(id, entry)| PinInfo {
             id: *id,
             size: entry.size,
+            position: entry.position,
+            display_size: entry.display_size,
+            opacity: entry.opacity,
         })
         .collect())
+}
+
+pub fn copy_pin(id: u64) -> Result<()> {
+    let image = registry()
+        .lock()
+        .expect("pin registry poisoned")
+        .get(&id)
+        .map(|entry| entry.image.clone())
+        .ok_or(WinScreenError::NotImplemented {
+            feature: "pin handle not found",
+        })?;
+    io::write_clipboard_image(&image)
+}
+
+pub fn save_pin(id: u64, path: &Path) -> Result<()> {
+    let image = registry()
+        .lock()
+        .expect("pin registry poisoned")
+        .get(&id)
+        .map(|entry| entry.image.clone())
+        .ok_or(WinScreenError::NotImplemented {
+            feature: "pin handle not found",
+        })?;
+    io::save_png(&image, path)
 }
 
 fn registry() -> &'static Mutex<HashMap<u64, PinEntry>> {
@@ -197,6 +235,18 @@ fn run_pin_window(
     let _ = startup.send(Ok(PinEntry {
         hwnd,
         size: state.image.size(),
+        position: ApiRect {
+            x: virtual_rect.x + 80,
+            y: virtual_rect.y + 80,
+            width: window_w as u32,
+            height: window_h as u32,
+        },
+        display_size: Size {
+            width: window_w as u32,
+            height: window_h as u32,
+        },
+        opacity: 1.0,
+        image: state.image.clone(),
     }));
 
     let leaked_state = Box::into_raw(state);
@@ -224,6 +274,12 @@ unsafe extern "system" fn wnd_proc(
     let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut PinWindowState;
 
     match msg {
+        WM_NCHITTEST => {
+            let hit = hit_test_resize(hwnd, lparam);
+            if hit != HTCLIENT {
+                return LRESULT(hit as isize);
+            }
+        }
         WM_PAINT => {
             if let Some(state) = state_ptr.as_ref() {
                 paint(hwnd, state);
@@ -253,10 +309,9 @@ unsafe extern "system" fn wnd_proc(
                 if ctrl_pressed(wparam) {
                     let next = (state.opacity as i16 + if delta > 0 { 18 } else { -18 })
                         .clamp(38, 255) as u8;
-                    state.opacity = next;
-                    SetLayeredWindowAttributes(hwnd, COLORREF(0), next, LWA_ALPHA).ok();
+                    apply_opacity(hwnd, state, next);
                 } else {
-                    zoom_window(hwnd, delta);
+                    zoom_window(hwnd, state, delta);
                 }
                 return LRESULT(0);
             }
@@ -268,9 +323,24 @@ unsafe extern "system" fn wnd_proc(
         WM_PIN_SET_OPACITY => {
             let alpha = wparam.0.clamp(26, 255) as u8;
             if let Some(state) = state_ptr.as_mut() {
-                state.opacity = alpha;
+                apply_opacity(hwnd, state, alpha);
             }
-            SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha, LWA_ALPHA).ok();
+            return LRESULT(0);
+        }
+        WM_PIN_CLOSE => {
+            let _ = DestroyWindow(hwnd);
+            return LRESULT(0);
+        }
+        WM_WINDOWPOSCHANGING => {
+            if let Some(state) = state_ptr.as_ref() {
+                constrain_window_pos(state, lparam);
+            }
+        }
+        WM_SIZE | WM_EXITSIZEMOVE => {
+            if let Some(state) = state_ptr.as_ref() {
+                update_registry_window_state(hwnd, state);
+                let _ = InvalidateRect(hwnd, None, true);
+            }
             return LRESULT(0);
         }
         WM_DESTROY => {
@@ -314,7 +384,13 @@ unsafe fn paint(hwnd: HWND, state: &PinWindowState) {
     let _ = EndPaint(hwnd, &ps);
 }
 
-unsafe fn zoom_window(hwnd: HWND, delta: i16) {
+unsafe fn apply_opacity(hwnd: HWND, state: &mut PinWindowState, alpha: u8) {
+    state.opacity = alpha.clamp(26, 255);
+    SetLayeredWindowAttributes(hwnd, COLORREF(0), state.opacity, LWA_ALPHA).ok();
+    update_registry_window_state(hwnd, state);
+}
+
+unsafe fn zoom_window(hwnd: HWND, state: &PinWindowState, delta: i16) {
     let mut client = RECT::default();
     if GetClientRect(hwnd, &mut client).is_err() {
         return;
@@ -328,8 +404,9 @@ unsafe fn zoom_window(hwnd: HWND, delta: i16) {
 
     let factor = if delta > 0 { 1.1_f32 } else { 0.9_f32 };
     let next_w = ((width as f32 * factor).round() as i32).clamp(80, 2400);
-    let next_h = ((height as f32 * factor).round() as i32).clamp(60, 1800);
+    let next_h = proportional_height(state, next_w).clamp(60, 1800);
     resize_window(hwnd, next_w, next_h);
+    update_registry_window_state(hwnd, state);
 }
 
 unsafe fn resize_window(hwnd: HWND, width: i32, height: i32) {
@@ -343,6 +420,73 @@ unsafe fn resize_window(hwnd: HWND, width: i32, height: i32) {
         SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
     )
     .ok();
+}
+
+unsafe fn hit_test_resize(hwnd: HWND, lparam: LPARAM) -> u32 {
+    let x = (lparam.0 & 0xffff) as u16 as i16 as i32;
+    let y = ((lparam.0 >> 16) & 0xffff) as u16 as i16 as i32;
+    let mut rect = RECT::default();
+    if GetWindowRect(hwnd, &mut rect).is_err() {
+        return HTCLIENT;
+    }
+
+    let left = x - rect.left <= RESIZE_BORDER;
+    let right = rect.right - x <= RESIZE_BORDER;
+    let top = y - rect.top <= RESIZE_BORDER;
+    let bottom = rect.bottom - y <= RESIZE_BORDER;
+
+    match (left, right, top, bottom) {
+        (true, _, true, _) => HTTOPLEFT,
+        (_, true, true, _) => HTTOPRIGHT,
+        (true, _, _, true) => HTBOTTOMLEFT,
+        (_, true, _, true) => HTBOTTOMRIGHT,
+        (true, _, _, _) => HTLEFT,
+        (_, true, _, _) => HTRIGHT,
+        (_, _, true, _) => HTTOP,
+        (_, _, _, true) => HTBOTTOM,
+        _ => HTCLIENT,
+    }
+}
+
+unsafe fn update_registry_window_state(hwnd: HWND, state: &PinWindowState) {
+    let mut rect = RECT::default();
+    if GetWindowRect(hwnd, &mut rect).is_err() {
+        return;
+    }
+    let width = (rect.right - rect.left).max(1) as u32;
+    let height = (rect.bottom - rect.top).max(1) as u32;
+    if let Some(entry) = registry()
+        .lock()
+        .expect("pin registry poisoned")
+        .get_mut(&state.id)
+    {
+        entry.position = ApiRect {
+            x: rect.left,
+            y: rect.top,
+            width,
+            height,
+        };
+        entry.display_size = Size { width, height };
+        entry.opacity = state.opacity as f32 / 255.0;
+    }
+}
+
+fn proportional_height(state: &PinWindowState, width: i32) -> i32 {
+    ((width as f32 * state.image.height as f32 / state.image.width as f32).round() as i32).max(60)
+}
+
+unsafe fn constrain_window_pos(state: &PinWindowState, lparam: LPARAM) {
+    let pos = &mut *(lparam.0 as *mut WINDOWPOS);
+    if (pos.flags & SWP_NOSIZE).0 != 0 {
+        return;
+    }
+    if pos.cx <= 0 || pos.cy <= 0 {
+        return;
+    }
+    let width = pos.cx.clamp(80, 2400);
+    let height = proportional_height(state, width).clamp(60, 1800);
+    pos.cx = width;
+    pos.cy = height;
 }
 
 fn wheel_delta(wparam: WPARAM) -> i16 {

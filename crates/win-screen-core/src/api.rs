@@ -187,14 +187,46 @@ impl Screenshot {
     pub fn capture_window(hwnd: isize) -> Result<CapturedImage> {
         capture::capture_window(hwnd)
     }
+
+    pub fn monitors() -> Result<Vec<MonitorInfo>> {
+        capture::list_monitors()
+    }
+
+    pub fn windows() -> Result<Vec<WindowInfo>> {
+        capture::list_windows()
+    }
 }
 
 pub struct Capturer;
 
+#[derive(Debug, Clone)]
+pub struct InteractiveCaptureResult {
+    pub image: CapturedImage,
+    pub pin_requested: bool,
+}
+
 impl Capturer {
     pub fn interactive(opts: InteractiveCaptureOptions) -> Result<Option<CapturedImage>> {
-        let Some(image) = crate::overlay::interactive_capture()? else {
+        Ok(Self::interactive_with_result(opts)?.map(|result| result.image))
+    }
+
+    pub fn interactive_with_result(
+        opts: InteractiveCaptureOptions,
+    ) -> Result<Option<InteractiveCaptureResult>> {
+        let Some((selection, image)) = crate::overlay::interactive_capture_selection()? else {
             return Ok(None);
+        };
+        let (image, pin_requested) = if opts.annotate {
+            let Some(result) = crate::annotate::edit_image_with_action_at(image, Some(selection))?
+            else {
+                return Ok(None);
+            };
+            (
+                result.image,
+                matches!(result.action, crate::annotate::AnnotationEditAction::Pin),
+            )
+        } else {
+            (image, false)
         };
 
         if let Some(path) = opts.save_path.as_ref() {
@@ -205,7 +237,10 @@ impl Capturer {
             image.copy_to_clipboard()?;
         }
 
-        Ok(Some(image))
+        Ok(Some(InteractiveCaptureResult {
+            image,
+            pin_requested,
+        }))
     }
 }
 
@@ -218,6 +253,23 @@ pub struct PinHandle {
 pub struct PinInfo {
     pub id: u64,
     pub size: Size,
+    pub position: Rect,
+    pub display_size: Size,
+    pub opacity: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MonitorInfo {
+    pub id: u32,
+    pub rect: Rect,
+    pub primary: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindowInfo {
+    pub hwnd: isize,
+    pub title: String,
+    pub rect: Rect,
 }
 
 impl PinHandle {
@@ -238,6 +290,14 @@ impl PinHandle {
     pub fn set_opacity(&self, opacity: f32) -> Result<()> {
         pin::set_pin_opacity(self.id, opacity)
     }
+
+    pub fn copy_to_clipboard(&self) -> Result<()> {
+        pin::copy_pin(self.id)
+    }
+
+    pub fn save_png(&self, path: impl AsRef<Path>) -> Result<()> {
+        pin::save_pin(self.id, path.as_ref())
+    }
 }
 
 pub struct Pin;
@@ -254,6 +314,14 @@ impl Pin {
 
     pub fn list() -> Result<Vec<PinInfo>> {
         pin::list_pins()
+    }
+
+    pub fn copy(id: u64) -> Result<()> {
+        pin::copy_pin(id)
+    }
+
+    pub fn save_png(id: u64, path: impl AsRef<Path>) -> Result<()> {
+        pin::save_pin(id, path.as_ref())
     }
 }
 
