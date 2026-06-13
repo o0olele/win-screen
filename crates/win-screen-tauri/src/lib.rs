@@ -73,6 +73,11 @@ pub struct RecordingOptions {
     pub output: PathBuf,
     pub system_audio: Option<bool>,
     pub microphone: Option<bool>,
+    /// Record a specific monitor (0-based index). Ignored when `region` is set.
+    pub monitor: Option<u32>,
+    /// Record a specific region [x, y, width, height] in virtual screen coordinates.
+    /// Takes priority over `monitor`.
+    pub region: Option<[i32; 4]>,
 }
 
 #[derive(Debug, Serialize)]
@@ -296,8 +301,18 @@ pub mod commands {
 
     #[tauri::command]
     pub fn start_recording(options: RecordingOptions) -> Result<RecordingResponse, String> {
+        let target = if let Some(r) = options.region {
+            let rect = Rect::new(r[0], r[1], r[2] as u32, r[3] as u32)
+                .map_err(|err| err.to_string())?;
+            RecordingTarget::Region(rect)
+        } else if let Some(idx) = options.monitor {
+            RecordingTarget::Monitor(idx)
+        } else {
+            RecordingTarget::Fullscreen
+        };
+
         let handle = Recorder::builder()
-            .target(RecordingTarget::Fullscreen)
+            .target(target)
             .audio(AudioOptions {
                 system: options.system_audio.unwrap_or(true),
                 microphone: options.microphone.unwrap_or(false),

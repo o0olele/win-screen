@@ -67,6 +67,13 @@ struct RecordArgs {
 
     #[arg(long, value_enum, value_delimiter = ',', default_value = "system")]
     audio: Vec<AudioSource>,
+
+    #[arg(long, conflicts_with_all = ["monitor"], value_names = ["X", "Y", "WIDTH", "HEIGHT"], num_args = 4,
+          help = "Record a specific region (virtual screen coordinates)")]
+    region: Option<Vec<i32>>,
+
+    #[arg(long, conflicts_with_all = ["region"])]
+    monitor: Option<u32>,
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -185,8 +192,22 @@ fn record(args: RecordArgs) -> Result<()> {
             .any(|source| matches!(source, AudioSource::Mic)),
     };
 
+    let target = if let Some(region) = args.region {
+        let rect = Rect::new(
+            region[0],
+            region[1],
+            u32::try_from(region[2]).context("region width must be positive")?,
+            u32::try_from(region[3]).context("region height must be positive")?,
+        )?;
+        RecordingTarget::Region(rect)
+    } else if let Some(idx) = args.monitor {
+        RecordingTarget::Monitor(idx)
+    } else {
+        RecordingTarget::Fullscreen
+    };
+
     let handle = Recorder::builder()
-        .target(RecordingTarget::Fullscreen)
+        .target(target)
         .audio(audio)
         .output(args.output)
         .start()?;
