@@ -190,7 +190,11 @@ fn record(args: RecordArgs) -> Result<()> {
         .audio(audio)
         .output(args.output)
         .start()?;
-    println!("recording started: {}", handle.id());
+    println!("recording started (id {}), press Enter to stop...", handle.id());
+    let mut buf = [0u8; 1];
+    let _ = io::stdin().read(&mut buf);
+    let output = handle.stop()?;
+    println!("saved {}", output.display());
     Ok(())
 }
 

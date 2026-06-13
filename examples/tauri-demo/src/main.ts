@@ -22,9 +22,15 @@ type PinInfo = {
   id: number;
   size: { width: number; height: number };
   position: Rect;
-  displaySize?: { width: number; height: number };
-  display_size?: { width: number; height: number };
+  displaySize: { width: number; height: number };
   opacity: number;
+};
+
+type RawPinInfo = Partial<PinInfo> & {
+  display_size?: { width?: number; height?: number } | null;
+  displaySize?: { width?: number; height?: number } | null;
+  size?: { width?: number; height?: number } | null;
+  position?: Partial<Rect> | null;
 };
 
 const root = document.querySelector<HTMLDivElement>("#app");
@@ -100,8 +106,48 @@ async function copySelection() {
   });
 }
 
+function numberOr(value: unknown, fallback: number) {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function readSize(
+  value: { width?: number; height?: number } | null | undefined,
+  fallback = { width: 0, height: 0 },
+) {
+  return {
+    width: numberOr(value?.width, fallback.width),
+    height: numberOr(value?.height, fallback.height),
+  };
+}
+
+function readRect(value: RawPinInfo["position"]) {
+  return {
+    x: numberOr(value?.x, 0),
+    y: numberOr(value?.y, 0),
+    width: numberOr(value?.width, 0),
+    height: numberOr(value?.height, 0),
+  };
+}
+
+function normalizePin(pin: RawPinInfo | null | undefined): PinInfo | null {
+  if (!pin || typeof pin.id !== "number") {
+    return null;
+  }
+
+  const size = readSize(pin.size);
+  const displaySize = readSize(pin.displaySize ?? pin.display_size ?? pin.size, size);
+  return {
+    id: pin.id,
+    size,
+    displaySize,
+    position: readRect(pin.position),
+    opacity: numberOr(pin.opacity, 1),
+  };
+}
+
 async function refreshPins() {
-  pins = await plugin<PinInfo[]>("list_pins");
+  const rawPins = await plugin<RawPinInfo[]>("list_pins");
+  pins = rawPins.map(normalizePin).filter((pin): pin is PinInfo => pin !== null);
 }
 
 async function setPinOpacity(id: number, opacity: number) {
@@ -153,14 +199,12 @@ function pinsHtml() {
 
   return pins
     .map((pin) => {
-      const displaySize = pin.displaySize ?? pin.display_size ?? pin.size ?? { width: 0, height: 0 };
-      const position = pin.position ?? { x: 0, y: 0 };
       return `
         <div class="pin-row">
           <div>
             <strong>#${pin.id}</strong>
-            <span>${displaySize.width}x${displaySize.height}</span>
-            <span>${position.x}, ${position.y}</span>
+            <span>${pin.displaySize.width}x${pin.displaySize.height}</span>
+            <span>${pin.position.x}, ${pin.position.y}</span>
           </div>
           <div class="pin-actions">
             <button data-action="opacity-100" data-id="${pin.id}">100%</button>

@@ -12,8 +12,9 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, EndPaint, FillRect,
-    GetStockObject, InvalidateRect, SelectObject, StretchBlt, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
-    DIB_RGB_COLORS, HBITMAP, HBRUSH, HDC, HGDIOBJ, PAINTSTRUCT, SRCCOPY, WHITE_BRUSH,
+    GetMonitorInfoW, GetStockObject, InvalidateRect, MonitorFromWindow, SelectObject, StretchBlt,
+    BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP, HBRUSH, HDC, HGDIOBJ, HMONITOR,
+    MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, SRCCOPY, WHITE_BRUSH,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
@@ -51,9 +52,13 @@ struct PinWindowState {
     image: CapturedImage,
     bitmap: HBITMAP,
     bitmap_dc: HDC,
-    original_width: i32,
-    original_height: i32,
     opacity: u8,
+    // Fullscreen toggle state.
+    is_fullscreen: bool,
+    pre_fs_x: i32,
+    pre_fs_y: i32,
+    pre_fs_w: i32,
+    pre_fs_h: i32,
 }
 
 pub fn pin_image(image: CapturedImage) -> Result<PinHandle> {
@@ -199,9 +204,12 @@ fn run_pin_window(
         image,
         bitmap,
         bitmap_dc,
-        original_width: window_w,
-        original_height: window_h,
         opacity: 255,
+        is_fullscreen: false,
+        pre_fs_x: 0,
+        pre_fs_y: 0,
+        pre_fs_w: window_w,
+        pre_fs_h: window_h,
     });
 
     let hwnd = unsafe {
@@ -298,8 +306,49 @@ unsafe extern "system" fn wnd_proc(
             return LRESULT(0);
         }
         WM_LBUTTONDBLCLK => {
-            if let Some(state) = state_ptr.as_ref() {
-                resize_window(hwnd, state.original_width, state.original_height);
+            if let Some(state) = state_ptr.as_mut() {
+                if state.is_fullscreen {
+                    // Restore to pre-fullscreen position and size.
+                    SetWindowPos(
+                        hwnd,
+                        None,
+                        state.pre_fs_x,
+                        state.pre_fs_y,
+                        state.pre_fs_w,
+                        state.pre_fs_h,
+                        SWP_NOZORDER | SWP_NOACTIVATE,
+                    )
+                    .ok();
+                    state.is_fullscreen = false;
+                } else {
+                    // Save current window rect before going fullscreen.
+                    let mut rect = RECT::default();
+                    GetWindowRect(hwnd, &mut rect).ok();
+                    state.pre_fs_x = rect.left;
+                    state.pre_fs_y = rect.top;
+                    state.pre_fs_w = rect.right - rect.left;
+                    state.pre_fs_h = rect.bottom - rect.top;
+
+                    // Query the monitor that contains the window.
+                    let hmonitor: HMONITOR = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+                    let mut mi = MONITORINFO {
+                        cbSize: size_of::<MONITORINFO>() as u32,
+                        ..Default::default()
+                    };
+                    let _ = GetMonitorInfoW(hmonitor, &mut mi);
+                    let mr = mi.rcMonitor;
+                    SetWindowPos(
+                        hwnd,
+                        None,
+                        mr.left,
+                        mr.top,
+                        mr.right - mr.left,
+                        mr.bottom - mr.top,
+                        SWP_NOZORDER | SWP_NOACTIVATE,
+                    )
+                    .ok();
+                    state.is_fullscreen = true;
+                }
                 return LRESULT(0);
             }
         }

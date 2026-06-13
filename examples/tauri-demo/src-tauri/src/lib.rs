@@ -73,6 +73,7 @@ fn start_interactive_capture_flow(
     thread::Builder::new()
         .name("win-screen-demo-capture-flow".to_string())
         .spawn(move || {
+            let _guard = CaptureRunningGuard;
             let app_for_decision = app.clone();
             let result =
                 win_screen_core::overlay::interactive_capture_selection_with_decision(move |rect| {
@@ -81,7 +82,6 @@ fn start_interactive_capture_flow(
 
             let Ok(Some((rect, image, decision))) = result else {
                 let _ = app.emit(EVENT_SELECTION_CANCELED, ());
-                capture_running().store(false, Ordering::SeqCst);
                 return;
             };
 
@@ -109,7 +109,6 @@ fn start_interactive_capture_flow(
                 pin_id,
             };
             let _ = app.emit(EVENT_SELECTION_DONE, payload);
-            capture_running().store(false, Ordering::SeqCst);
         })
         .map_err(|err| {
             capture_running().store(false, Ordering::SeqCst);
@@ -225,6 +224,14 @@ fn toolbar_sender() -> &'static Mutex<Option<Sender<SelectionDecision>>> {
 fn capture_running() -> &'static AtomicBool {
     static RUNNING: AtomicBool = AtomicBool::new(false);
     &RUNNING
+}
+
+struct CaptureRunningGuard;
+
+impl Drop for CaptureRunningGuard {
+    fn drop(&mut self) {
+        capture_running().store(false, Ordering::SeqCst);
+    }
 }
 
 fn show_toolbar_and_wait(app: &AppHandle, rect: Rect) -> SelectionDecision {
