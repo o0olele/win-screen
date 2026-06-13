@@ -8,6 +8,9 @@ pub enum WinScreenError {
     #[error("{feature} is not implemented yet")]
     NotImplemented { feature: &'static str },
 
+    #[error("recording error: {0}")]
+    Recording(String),
+
     #[error("invalid image buffer: {width}x{height} needs {expected} RGBA bytes, got {actual}")]
     InvalidImageBuffer {
         width: u32,

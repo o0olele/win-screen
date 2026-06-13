@@ -1,15 +1,25 @@
 use base64::Engine;
 use image::ImageEncoder;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{Mutex, OnceLock},
+};
 use tauri::{plugin::TauriPlugin, AppHandle, Emitter, Runtime};
 use win_screen_core::{
-    AudioOptions, CapturedImage, Capturer, InteractiveCaptureOptions, MonitorInfo, Pin, PinInfo,
-    Recorder, RecordingTarget, Rect, Screenshot, WindowInfo,
+    AudioOptions, CapturedImage, Capturer, HotkeyHandle, InteractiveCaptureOptions, MonitorInfo,
+    Pin, PinInfo, Recorder, RecordingTarget, Rect, Screenshot, WindowInfo,
 };
 
 pub const EVENT_CAPTURE_DONE: &str = "win-screen://capture-done";
 pub const EVENT_RECORDING_STOPPED: &str = "win-screen://recording-stopped";
+pub const EVENT_HOTKEY_FIRED: &str = "win-screen://hotkey-fired";
+
+fn hotkey_registry() -> &'static Mutex<HashMap<i32, HotkeyHandle>> {
+    static R: OnceLock<Mutex<HashMap<i32, HotkeyHandle>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -383,6 +393,39 @@ pub mod commands {
     pub fn close_pin(id: u64) -> Result<(), String> {
         win_screen_core::pin::close_pin(id).map_err(|err| err.to_string())
     }
+
+    /// Register a global hotkey. Emits `win-screen://hotkey-fired` with the
+    /// hotkey `id` each time the key combination is pressed.
+    ///
+    /// `modifiers`: bitwise OR of `hotkey_mod::*` constants (alt=1, ctrl=2,
+    /// shift=4, win=8, norepeat=0x4000).
+    /// `vk`: Windows virtual-key code (e.g. 0x2C for Print Screen).
+    #[tauri::command]
+    pub fn register_hotkey<R: Runtime>(
+        app: AppHandle<R>,
+        id: i32,
+        modifiers: u32,
+        vk: u32,
+    ) -> Result<(), String> {
+        let handle = win_screen_core::register_hotkey(id, modifiers, vk, move || {
+            let _ = app.emit(super::EVENT_HOTKEY_FIRED, id);
+        })
+        .map_err(|err| err.to_string())?;
+
+        super::hotkey_registry().lock().unwrap().insert(id, handle);
+        Ok(())
+    }
+
+    /// Unregister a previously registered global hotkey by its `id`.
+    #[tauri::command]
+    pub fn unregister_hotkey(id: i32) -> Result<(), String> {
+        super::hotkey_registry()
+            .lock()
+            .unwrap()
+            .remove(&id)
+            .map(|h| h.unregister())
+            .ok_or_else(|| format!("hotkey {id} not registered"))
+    }
 }
 
 pub fn init<R: Runtime>() -> TauriPlugin<R> {
@@ -409,7 +452,9 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
             commands::copy_pin,
             commands::save_pin,
             commands::set_pin_opacity,
-            commands::close_pin
+            commands::close_pin,
+            commands::register_hotkey,
+            commands::unregister_hotkey,
         ])
         .build()
 }

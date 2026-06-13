@@ -45,8 +45,8 @@ pub struct ScreenCapture {
     shared: Arc<CaptureShared>,
     encoder: SharedEncoder,
     crop: Option<(u32, u32, u32, u32)>,
-    // Reusable scratch buffer for as_nopadding_buffer (avoids per-frame allocation).
     scratch: Vec<u8>,
+    flip_scratch: Vec<u8>,
 }
 
 impl GraphicsCaptureApiHandler for ScreenCapture {
@@ -59,6 +59,7 @@ impl GraphicsCaptureApiHandler for ScreenCapture {
             encoder: ctx.flags.encoder,
             crop: ctx.flags.crop,
             scratch: Vec::new(),
+            flip_scratch: Vec::new(),
         })
     }
 
@@ -73,25 +74,24 @@ impl GraphicsCaptureApiHandler for ScreenCapture {
 
         if let Some(enc) = self.encoder.lock().unwrap().as_mut() {
             if let Some((sx, sy, ex, ey)) = self.crop {
-                // Region crop: extract the requested rectangle from the monitor surface.
                 let ts = frame.timestamp().map(|t| t.Duration).unwrap_or(0);
                 let fb = frame.buffer_crop(sx, sy, ex, ey)?;
                 let data = fb.as_nopadding_buffer(&mut self.scratch);
 
-                // D3D staging textures are top-down, but Media Foundation's raw BGRA8
-                // CPU buffer path expects bottom-up rows (same convention as DIBs).
-                // Flip the rows vertically before encoding.
+                // D3D staging textures are top-down; Media Foundation CPU buffer path
+                // expects bottom-up rows (DIB convention). Flip rows vertically.
                 let w = (ex - sx) as usize;
                 let h = (ey - sy) as usize;
                 let row_bytes = w * 4;
-                let mut flipped = vec![0u8; data.len()];
+                self.flip_scratch.resize(data.len(), 0);
                 for row in 0..h {
                     let src = row * row_bytes;
                     let dst = (h - 1 - row) * row_bytes;
-                    flipped[dst..dst + row_bytes].copy_from_slice(&data[src..src + row_bytes]);
+                    self.flip_scratch[dst..dst + row_bytes]
+                        .copy_from_slice(&data[src..src + row_bytes]);
                 }
 
-                enc.send_frame_buffer(&flipped, ts)?;
+                enc.send_frame_buffer(&self.flip_scratch, ts)?;
             } else {
                 enc.send_frame(frame)?;
             }
@@ -144,9 +144,8 @@ fn overlap_area(ax1: i32, ay1: i32, ax2: i32, ay2: i32,
 // Find the monitor that has the most overlap with `rect` and return the
 // Monitor plus crop coordinates in monitor-local space.
 fn find_monitor_for_region(rect: &Rect) -> Result<(Monitor, (u32, u32, u32, u32), u32, u32)> {
-    let monitors = Monitor::enumerate().map_err(|_| WinScreenError::NotImplemented {
-        feature: "monitor enumeration failed",
-    })?;
+    let monitors = Monitor::enumerate()
+        .map_err(|_| WinScreenError::Recording("monitor enumeration failed".into()))?;
 
     let rx1 = rect.x;
     let ry1 = rect.y;
@@ -165,9 +164,8 @@ fn find_monitor_for_region(rect: &Rect) -> Result<(Monitor, (u32, u32, u32, u32)
         }
     }
 
-    let (monitor, _, mi) = best.ok_or(WinScreenError::NotImplemented {
-        feature: "no monitor intersects the requested region",
-    })?;
+    let (monitor, _, mi) = best
+        .ok_or_else(|| WinScreenError::Recording("no monitor intersects the requested region".into()))?;
 
     let mr = mi.rcMonitor;
     let mx = mr.left;
@@ -185,9 +183,7 @@ fn find_monitor_for_region(rect: &Rect) -> Result<(Monitor, (u32, u32, u32, u32)
     let crop_h = ey.saturating_sub(sy);
 
     if crop_w == 0 || crop_h == 0 {
-        return Err(WinScreenError::NotImplemented {
-            feature: "region does not intersect any monitor",
-        });
+        return Err(WinScreenError::Recording("region does not intersect any monitor".into()));
     }
 
     Ok((monitor, (sx, sy, ex, ey), crop_w, crop_h))
@@ -199,19 +195,21 @@ pub fn start(_id: u64, options: RecordingOptions) -> Result<RecordingEntry> {
     // Resolve monitor, encoder dimensions, and optional crop.
     let (monitor, enc_width, enc_height, crop) = match &options.target {
         RecordingTarget::Fullscreen => {
-            let m = Monitor::primary().map_err(|_| WinScreenError::NotImplemented {
-                feature: "primary monitor not found",
-            })?;
-            let w = m.width().map_err(|_| WinScreenError::NotImplemented { feature: "monitor width query failed" })?;
-            let h = m.height().map_err(|_| WinScreenError::NotImplemented { feature: "monitor height query failed" })?;
+            let m = Monitor::primary()
+                .map_err(|_| WinScreenError::Recording("primary monitor not found".into()))?;
+            let w = m.width()
+                .map_err(|_| WinScreenError::Recording("monitor width query failed".into()))?;
+            let h = m.height()
+                .map_err(|_| WinScreenError::Recording("monitor height query failed".into()))?;
             (m, w, h, None)
         }
         RecordingTarget::Monitor(idx) => {
-            let m = Monitor::from_index((*idx as usize) + 1).map_err(|_| WinScreenError::NotImplemented {
-                feature: "monitor index out of range",
-            })?;
-            let w = m.width().map_err(|_| WinScreenError::NotImplemented { feature: "monitor width query failed" })?;
-            let h = m.height().map_err(|_| WinScreenError::NotImplemented { feature: "monitor height query failed" })?;
+            let m = Monitor::from_index((*idx as usize) + 1)
+                .map_err(|_| WinScreenError::Recording(format!("monitor index {} out of range", idx)))?;
+            let w = m.width()
+                .map_err(|_| WinScreenError::Recording("monitor width query failed".into()))?;
+            let h = m.height()
+                .map_err(|_| WinScreenError::Recording("monitor height query failed".into()))?;
             (m, w, h, None)
         }
         RecordingTarget::Region(rect) => {
@@ -241,7 +239,7 @@ pub fn start(_id: u64, options: RecordingOptions) -> Result<RecordingEntry> {
         ContainerSettingsBuilder::new(),
         &options.output,
     )
-    .map_err(|_| WinScreenError::NotImplemented { feature: "VideoEncoder creation failed" })?;
+    .map_err(|e| WinScreenError::Recording(format!("VideoEncoder creation failed: {e}")))?;
 
     let encoder: SharedEncoder = Arc::new(Mutex::new(Some(encoder)));
     let shared = Arc::new(CaptureShared { paused: AtomicBool::new(false) });
@@ -266,7 +264,7 @@ pub fn start(_id: u64, options: RecordingOptions) -> Result<RecordingEntry> {
     );
 
     let control = ScreenCapture::start_free_threaded(settings)
-        .map_err(|_| WinScreenError::NotImplemented { feature: "WGC capture start failed" })?;
+        .map_err(|e| WinScreenError::Recording(format!("WGC capture start failed: {e}")))?;
 
     let handler_arc = control.callback();
 
@@ -305,7 +303,7 @@ pub fn pause(id: u64) -> Result<()> {
     let guard = registry().lock().unwrap();
     guard
         .get(&id)
-        .ok_or(WinScreenError::NotImplemented { feature: "recording id not found (pause)" })
+        .ok_or_else(|| WinScreenError::Recording(format!("recording {id} not found")))
         .map(|entry| entry.shared.paused.store(true, Ordering::Relaxed))
 }
 
@@ -313,7 +311,7 @@ pub fn resume(id: u64) -> Result<()> {
     let guard = registry().lock().unwrap();
     guard
         .get(&id)
-        .ok_or(WinScreenError::NotImplemented { feature: "recording id not found (resume)" })
+        .ok_or_else(|| WinScreenError::Recording(format!("recording {id} not found")))
         .map(|entry| entry.shared.paused.store(false, Ordering::Relaxed))
 }
 
@@ -322,7 +320,7 @@ pub fn stop(id: u64) -> Result<PathBuf> {
         .lock()
         .unwrap()
         .remove(&id)
-        .ok_or(WinScreenError::NotImplemented { feature: "recording id not found (stop)" })?;
+        .ok_or_else(|| WinScreenError::Recording(format!("recording {id} not found")))?;
 
     // Stop audio capture threads first (no more send_audio_buffer after this).
     if let Some(audio) = entry.audio {
@@ -336,8 +334,8 @@ pub fn stop(id: u64) -> Result<PathBuf> {
     entry
         .done_rx
         .recv()
-        .map_err(|_| WinScreenError::NotImplemented { feature: "recording channel closed unexpectedly" })?
-        .map_err(|_| WinScreenError::NotImplemented { feature: "recording encoder finalisation failed" })?;
+        .map_err(|_| WinScreenError::Recording("recording channel closed unexpectedly".into()))?
+        .map_err(|msg| WinScreenError::Recording(format!("encoder finalisation failed: {msg}")))?;
 
     Ok(entry.output)
 }

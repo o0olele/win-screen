@@ -16,3 +16,4 @@ pub use api::{
     WinScreenEvent, WindowInfo,
 };
 pub use error::{Result, WinScreenError};
+pub use platform::{hotkey_mod, register_hotkey, HotkeyHandle};
