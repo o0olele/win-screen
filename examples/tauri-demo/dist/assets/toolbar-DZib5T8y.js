@@ -1,0 +1,1 @@
+import{i as e}from"./core-B8jQGe47.js";document.addEventListener("click",t=>{const o=t.target.closest("button[data-action]");o&&e("toolbar_decide",{options:{action:o.dataset.action??"confirm"}})});document.addEventListener("keydown",t=>{t.key==="Escape"&&e("toolbar_decide",{options:{action:"cancel"}})});

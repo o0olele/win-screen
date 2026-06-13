@@ -10,6 +10,7 @@ pub mod pin;
 pub mod platform;
 pub mod record;
 
+pub use overlay::RegionIndicator;
 pub use api::{
     AudioOptions, CapturedImage, Capturer, InteractiveCaptureOptions, MonitorInfo, Pin, PinHandle,
     PinInfo, Recorder, RecordingHandle, RecordingOptions, RecordingTarget, Rect, Screenshot, Size,

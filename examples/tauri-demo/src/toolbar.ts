@@ -10,3 +10,9 @@ document.addEventListener("click", (event) => {
     options: { action: button.dataset.action ?? "confirm" },
   });
 });
+
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") {
+    void invoke("toolbar_decide", { options: { action: "cancel" } });
+  }
+});
