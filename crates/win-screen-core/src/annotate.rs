@@ -17,6 +17,45 @@ pub enum AnnotationTool {
 pub enum AnnotationEditAction {
     Confirm,
     Pin,
+    Save,
+}
+
+/// External-toolbar annotation editor. Mirrors [`crate::overlay::InteractiveOverlay`]:
+/// win-screen-core runs the editor window and does all the drawing, while the host
+/// (e.g. a Tauri WebView) renders the toolbar and drives the editor by posting
+/// [`AnnotationCommand`]s via [`post_annotation_command`]. The editor no longer
+/// draws its own toolbar.
+#[cfg(windows)]
+pub struct AnnotationOverlay {
+    /// Toolbar size in physical pixels — used to position the host toolbar window.
+    pub toolbar_size: (u32, u32),
+    /// Move the host toolbar to the given screen rect and show it. Called once the
+    /// editor window is up.
+    pub place_toolbar: Box<dyn Fn(Rect) + Send>,
+    /// Hide the host toolbar (called when the editor finishes).
+    pub hide_toolbar: Box<dyn Fn() + Send>,
+    /// Called once with the editor HWND (as `usize`) so the host can post commands
+    /// back via [`post_annotation_command`].
+    pub on_ready: Box<dyn Fn(usize) + Send>,
+}
+
+/// A command posted from the host toolbar into a running [`AnnotationOverlay`]
+/// editor. Selects the active tool/color/width or finishes the edit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnnotationCommand {
+    SetTool(AnnotationTool),
+    /// Deselect the active tool (return to selection mode). Only meaningful for the
+    /// selection overlay; the standalone editor treats it as a no-op.
+    DeselectTool,
+    SetColor(Color),
+    SetStrokeWidth(u32),
+    Undo,
+    Redo,
+    Clear,
+    Confirm,
+    Pin,
+    Save,
+    Cancel,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -138,6 +177,11 @@ impl AnnotationDocument {
         self.undone.clear();
     }
 
+    pub fn clear(&mut self) {
+        self.shapes.clear();
+        self.undone.clear();
+    }
+
     pub fn undo(&mut self) -> bool {
         let Some(shape) = self.shapes.pop() else {
             return false;
@@ -160,6 +204,111 @@ impl AnnotationDocument {
             shape.apply(&mut output)?;
         }
         Ok(output)
+    }
+
+    /// Like [`render`](Self::render), but every shape is translated by `(dx, dy)`
+    /// before being applied. Used when shapes are stored in screen-absolute
+    /// coordinates and must be mapped into a captured region's local space (pass
+    /// `-rect.x, -rect.y`). Pixels falling outside the image are clipped.
+    pub fn render_offset(&self, image: &CapturedImage, dx: i32, dy: i32) -> Result<CapturedImage> {
+        let mut output = image.clone();
+        for shape in &self.shapes {
+            shape.translated(dx, dy).apply(&mut output)?;
+        }
+        Ok(output)
+    }
+}
+
+impl AnnotationShape {
+    /// Return a copy of this shape with all of its coordinates shifted by `(dx, dy)`.
+    pub fn translated(&self, dx: i32, dy: i32) -> AnnotationShape {
+        let tp = |p: Point| Point {
+            x: p.x + dx,
+            y: p.y + dy,
+        };
+        let tr = |r: Rect| Rect {
+            x: r.x + dx,
+            y: r.y + dy,
+            width: r.width,
+            height: r.height,
+        };
+        match self {
+            AnnotationShape::Rectangle {
+                rect,
+                stroke,
+                stroke_width,
+            } => AnnotationShape::Rectangle {
+                rect: tr(*rect),
+                stroke: *stroke,
+                stroke_width: *stroke_width,
+            },
+            AnnotationShape::Ellipse {
+                rect,
+                stroke,
+                stroke_width,
+            } => AnnotationShape::Ellipse {
+                rect: tr(*rect),
+                stroke: *stroke,
+                stroke_width: *stroke_width,
+            },
+            AnnotationShape::Arrow {
+                start,
+                end,
+                stroke,
+                stroke_width,
+            } => AnnotationShape::Arrow {
+                start: tp(*start),
+                end: tp(*end),
+                stroke: *stroke,
+                stroke_width: *stroke_width,
+            },
+            AnnotationShape::Line {
+                start,
+                end,
+                stroke,
+                stroke_width,
+            } => AnnotationShape::Line {
+                start: tp(*start),
+                end: tp(*end),
+                stroke: *stroke,
+                stroke_width: *stroke_width,
+            },
+            AnnotationShape::Brush {
+                points,
+                stroke,
+                stroke_width,
+            } => AnnotationShape::Brush {
+                points: points.iter().map(|p| tp(*p)).collect(),
+                stroke: *stroke,
+                stroke_width: *stroke_width,
+            },
+            AnnotationShape::Text {
+                origin,
+                text,
+                color,
+                font_size,
+            } => AnnotationShape::Text {
+                origin: tp(*origin),
+                text: text.clone(),
+                color: *color,
+                font_size: *font_size,
+            },
+            AnnotationShape::Mosaic { rect, block_size } => AnnotationShape::Mosaic {
+                rect: tr(*rect),
+                block_size: *block_size,
+            },
+            AnnotationShape::Number {
+                center,
+                value,
+                fill,
+                text,
+            } => AnnotationShape::Number {
+                center: tp(*center),
+                value: *value,
+                fill: *fill,
+                text: *text,
+            },
+        }
     }
 }
 
@@ -251,6 +400,25 @@ pub fn edit_image_with_action_at(
         let _ = image;
         Err(WinScreenError::UnsupportedPlatform)
     }
+}
+
+/// Run the annotation editor with an *external* (host-rendered) toolbar. The editor
+/// window shows the image and handles all drawing; the host renders the toolbar and
+/// drives the editor via [`post_annotation_command`]. See [`AnnotationOverlay`].
+#[cfg(windows)]
+pub fn edit_image_with_overlay(
+    image: CapturedImage,
+    anchor: Option<Rect>,
+    overlay: AnnotationOverlay,
+) -> Result<Option<AnnotationEditResult>> {
+    windows_editor::edit_image_with_overlay(image, anchor, overlay)
+}
+
+/// Post a command to a running [`AnnotationOverlay`] editor, identified by the HWND
+/// delivered through [`AnnotationOverlay::on_ready`].
+#[cfg(windows)]
+pub fn post_annotation_command(hwnd: usize, command: AnnotationCommand) {
+    windows_editor::post_annotation_command(hwnd, command);
 }
 
 fn normalize_rect(start: Point, end: Point) -> Option<Rect> {
@@ -718,10 +886,11 @@ mod windows_text {
 #[cfg(windows)]
 mod windows_editor {
     use super::{
-        normalize_rect, AnnotationDocument, AnnotationEditAction, AnnotationEditResult,
-        AnnotationShape, AnnotationTool, Color, Point,
+        normalize_rect, AnnotationCommand, AnnotationDocument, AnnotationEditAction,
+        AnnotationEditResult, AnnotationOverlay, AnnotationShape, AnnotationTool, Color, Point,
     };
     use crate::{platform, CapturedImage, Rect, Result, WinScreenError};
+    use std::ffi::c_void;
     use std::mem::size_of;
     use std::ptr::null_mut;
     use std::time::{Duration, Instant};
@@ -740,15 +909,18 @@ mod windows_editor {
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos,
-        GetMessageW, GetWindowLongPtrW, LoadCursorW, PostQuitMessage, RegisterClassW,
+        GetMessageW, GetWindowLongPtrW, LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassW,
         SetWindowLongPtrW, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA,
         IDC_CROSS, MSG, SW_SHOW, WM_CHAR, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN,
-        WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONDOWN, WNDCLASSW, WS_EX_TOOLWINDOW,
+        WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONDOWN, WM_USER, WNDCLASSW, WS_EX_TOOLWINDOW,
         WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
     };
 
     const CLASS_NAME: &str = "WinScreenAnnotationEditor";
     const TOOLBAR_HEIGHT: i32 = 42;
+    // Custom posted message carrying an AnnotationCommand from the host toolbar.
+    // wparam = kind, lparam = payload (tool index / packed RGBA / stroke width).
+    const WM_ANNOT_CMD: u32 = WM_USER + 1;
 
     struct EditorState {
         image: CapturedImage,
@@ -756,6 +928,8 @@ mod windows_editor {
         bitmap_dc: HDC,
         doc: AnnotationDocument,
         tool: AnnotationTool,
+        color: Color,
+        stroke_width: u32,
         drawing_start: Option<Point>,
         current: Point,
         brush_points: Vec<Point>,
@@ -766,25 +940,92 @@ mod windows_editor {
         scale: f32,
         window_width: i32,
         window_height: i32,
+        // Height of the in-window native toolbar strip. 0 when the host renders an
+        // external toolbar (no native toolbar drawn).
+        toolbar_height: i32,
+        // True when driven by an external (host) toolbar via WM_ANNOT_CMD.
+        external: bool,
         toolbar_ready_at: Instant,
+    }
+
+    /// Toolbar provider for the editor: either the legacy in-window native toolbar
+    /// or a host-rendered external toolbar driven via [`WM_ANNOT_CMD`].
+    enum ToolbarMode {
+        Native,
+        External {
+            toolbar_size: (u32, u32),
+            place_toolbar: Box<dyn Fn(Rect) + Send>,
+            on_ready: Box<dyn Fn(usize) + Send>,
+        },
     }
 
     pub fn edit_image_with_action(
         image: CapturedImage,
         anchor: Option<Rect>,
     ) -> Result<Option<AnnotationEditResult>> {
+        run_editor(image, anchor, ToolbarMode::Native)
+    }
+
+    pub fn edit_image_with_overlay(
+        image: CapturedImage,
+        anchor: Option<Rect>,
+        overlay: AnnotationOverlay,
+    ) -> Result<Option<AnnotationEditResult>> {
+        run_editor(
+            image,
+            anchor,
+            ToolbarMode::External {
+                toolbar_size: overlay.toolbar_size,
+                place_toolbar: overlay.place_toolbar,
+                on_ready: overlay.on_ready,
+            },
+        )
+    }
+
+    pub fn post_annotation_command(hwnd: usize, command: AnnotationCommand) {
+        let (kind, payload): (usize, isize) = match command {
+            AnnotationCommand::SetTool(tool) => (0, tool_index(tool) as isize),
+            AnnotationCommand::DeselectTool => (10, 0),
+            AnnotationCommand::SetColor(color) => (1, pack_rgba(color) as isize),
+            AnnotationCommand::SetStrokeWidth(width) => (2, width as isize),
+            AnnotationCommand::Undo => (3, 0),
+            AnnotationCommand::Redo => (4, 0),
+            AnnotationCommand::Clear => (5, 0),
+            AnnotationCommand::Confirm => (6, 0),
+            AnnotationCommand::Pin => (7, 0),
+            AnnotationCommand::Save => (8, 0),
+            AnnotationCommand::Cancel => (9, 0),
+        };
+        unsafe {
+            let _ = PostMessageW(
+                HWND(hwnd as *mut c_void),
+                WM_ANNOT_CMD,
+                WPARAM(kind),
+                LPARAM(payload),
+            );
+        }
+    }
+
+    fn run_editor(
+        image: CapturedImage,
+        anchor: Option<Rect>,
+        mode: ToolbarMode,
+    ) -> Result<Option<AnnotationEditResult>> {
         platform::set_process_dpi_aware().ok();
+        let external = matches!(mode, ToolbarMode::External { .. });
+        let toolbar_height = if external { 0 } else { TOOLBAR_HEIGHT };
+
         let (bitmap, bitmap_dc) = create_bitmap(&image)?;
         let virtual_rect = platform::virtual_screen_rect()?;
         let max_w = (virtual_rect.width as i32 - 160).max(320);
-        let max_h = (virtual_rect.height as i32 - 140 - TOOLBAR_HEIGHT).max(240);
+        let max_h = (virtual_rect.height as i32 - 140 - toolbar_height).max(240);
         let scale = (max_w as f32 / image.width as f32)
             .min(max_h as f32 / image.height as f32)
             .min(1.0);
         let image_w = (image.width as f32 * scale).round().max(1.0) as i32;
         let image_h = (image.height as f32 * scale).round().max(1.0) as i32;
         let window_width = image_w;
-        let window_height = image_h + TOOLBAR_HEIGHT;
+        let window_height = image_h + toolbar_height;
 
         let class_name = wide(CLASS_NAME);
         let hinstance = unsafe { GetModuleHandleW(None) }?;
@@ -807,6 +1048,8 @@ mod windows_editor {
             bitmap_dc,
             doc: AnnotationDocument::new(),
             tool: AnnotationTool::Rectangle,
+            color: Color::RED,
+            stroke_width: 3,
             drawing_start: None,
             current: Point { x: 0, y: 0 },
             brush_points: Vec::new(),
@@ -817,6 +1060,8 @@ mod windows_editor {
             scale,
             window_width,
             window_height,
+            toolbar_height,
+            external,
             toolbar_ready_at: Instant::now() + Duration::from_millis(250),
         });
 
@@ -850,6 +1095,25 @@ mod windows_editor {
             let _ = InvalidateRect(hwnd, None, true);
         }
 
+        // External mode: hand the host our HWND and ask it to place its toolbar
+        // next to the editor window.
+        if let ToolbarMode::External {
+            toolbar_size,
+            place_toolbar,
+            on_ready,
+        } = &mode
+        {
+            on_ready(hwnd.0 as usize);
+            let rect = toolbar_rect(
+                window_x,
+                window_y,
+                window_width,
+                *toolbar_size,
+                virtual_rect,
+            );
+            place_toolbar(rect);
+        }
+
         let state_ptr = Box::into_raw(state);
         let mut msg = MSG::default();
         while unsafe { GetMessageW(&mut msg, None, 0, 0) }.as_bool() {
@@ -861,6 +1125,74 @@ mod windows_editor {
 
         let mut state = unsafe { Box::from_raw(state_ptr) };
         Ok(state.result.take().unwrap_or(None))
+    }
+
+    fn tool_index(tool: AnnotationTool) -> usize {
+        match tool {
+            AnnotationTool::Rectangle => 0,
+            AnnotationTool::Ellipse => 1,
+            AnnotationTool::Arrow => 2,
+            AnnotationTool::Line => 3,
+            AnnotationTool::Brush => 4,
+            AnnotationTool::Text => 5,
+            AnnotationTool::Mosaic => 6,
+            AnnotationTool::Number => 7,
+        }
+    }
+
+    fn tool_from_index(idx: usize) -> Option<AnnotationTool> {
+        Some(match idx {
+            0 => AnnotationTool::Rectangle,
+            1 => AnnotationTool::Ellipse,
+            2 => AnnotationTool::Arrow,
+            3 => AnnotationTool::Line,
+            4 => AnnotationTool::Brush,
+            5 => AnnotationTool::Text,
+            6 => AnnotationTool::Mosaic,
+            7 => AnnotationTool::Number,
+            _ => return None,
+        })
+    }
+
+    fn pack_rgba(color: Color) -> i32 {
+        ((color.r as i32) << 24)
+            | ((color.g as i32) << 16)
+            | ((color.b as i32) << 8)
+            | (color.a as i32)
+    }
+
+    fn unpack_rgba(value: i32) -> Color {
+        Color {
+            r: ((value >> 24) & 0xff) as u8,
+            g: ((value >> 16) & 0xff) as u8,
+            b: ((value >> 8) & 0xff) as u8,
+            a: (value & 0xff) as u8,
+        }
+    }
+
+    /// Position the host toolbar centered above the editor window (or below if it
+    /// would go off the top of the virtual screen).
+    fn toolbar_rect(
+        window_x: i32,
+        window_y: i32,
+        window_width: i32,
+        toolbar_size: (u32, u32),
+        virtual_rect: Rect,
+    ) -> Rect {
+        let (tw, th) = (toolbar_size.0 as i32, toolbar_size.1 as i32);
+        let gap = 8;
+        let min_x = virtual_rect.x;
+        let max_x = (virtual_rect.x + virtual_rect.width as i32 - tw).max(min_x);
+        let x = (window_x + (window_width - tw) / 2).clamp(min_x, max_x);
+        let above = window_y - th - gap;
+        let below = window_y + gap; // overlap top of editor slightly if needed
+        let y = if above >= virtual_rect.y { above } else { below };
+        Rect {
+            x,
+            y,
+            width: tw.max(1) as u32,
+            height: th.max(1) as u32,
+        }
     }
 
     unsafe extern "system" fn wnd_proc(
@@ -875,7 +1207,7 @@ mod windows_editor {
             WM_LBUTTONDOWN => {
                 if let Some(state) = state_ptr.as_mut() {
                     let point = image_point_from_cursor(hwnd, state);
-                    if cursor_in_toolbar(hwnd, state) {
+                    if !state.external && cursor_in_toolbar(hwnd, state) {
                         handle_toolbar_click(hwnd, state);
                         return LRESULT(0);
                     }
@@ -886,7 +1218,7 @@ mod windows_editor {
                         state.doc.push(AnnotationShape::Number {
                             center: point,
                             value: state.number,
-                            fill: Color::RED,
+                            fill: state.color,
                             text: Color::WHITE,
                         });
                         state.number += 1;
@@ -992,6 +1324,49 @@ mod windows_editor {
                     return LRESULT(0);
                 }
             }
+            WM_ANNOT_CMD => {
+                if let Some(state) = state_ptr.as_mut() {
+                    match wparam.0 {
+                        0 => {
+                            if let Some(tool) = tool_from_index(lparam.0 as usize) {
+                                state.tool = tool;
+                            }
+                        }
+                        1 => state.color = unpack_rgba(lparam.0 as i32),
+                        2 => state.stroke_width = (lparam.0 as u32).max(1),
+                        3 => {
+                            state.doc.undo();
+                        }
+                        4 => {
+                            state.doc.redo();
+                        }
+                        5 => state.doc.clear(),
+                        6 => {
+                            state.result = finish_edit(state, AnnotationEditAction::Confirm).ok();
+                            let _ = DestroyWindow(hwnd);
+                            return LRESULT(0);
+                        }
+                        7 => {
+                            state.result = finish_edit(state, AnnotationEditAction::Pin).ok();
+                            let _ = DestroyWindow(hwnd);
+                            return LRESULT(0);
+                        }
+                        8 => {
+                            state.result = finish_edit(state, AnnotationEditAction::Save).ok();
+                            let _ = DestroyWindow(hwnd);
+                            return LRESULT(0);
+                        }
+                        9 => {
+                            state.result = Some(None);
+                            let _ = DestroyWindow(hwnd);
+                            return LRESULT(0);
+                        }
+                        _ => {}
+                    }
+                    let _ = InvalidateRect(hwnd, None, false);
+                    return LRESULT(0);
+                }
+            }
             WM_PAINT => {
                 if let Some(state) = state_ptr.as_ref() {
                     paint(hwnd, state);
@@ -1058,11 +1433,11 @@ mod windows_editor {
         let _ = FillRect(mem_dc, &client, bg);
         let _ = DeleteObject(HGDIOBJ(bg.0));
 
-        let image_h = state.window_height - TOOLBAR_HEIGHT;
+        let image_h = state.window_height - state.toolbar_height;
         let _ = StretchBlt(
             mem_dc,
             0,
-            TOOLBAR_HEIGHT,
+            state.toolbar_height,
             state.window_width,
             image_h,
             state.bitmap_dc,
@@ -1082,7 +1457,9 @@ mod windows_editor {
         if let Some(origin) = state.text_origin {
             draw_text_preview(mem_dc, state, origin, &state.text_buffer);
         }
-        draw_toolbar(mem_dc, state);
+        if !state.external {
+            draw_toolbar(mem_dc, state);
+        }
 
         let _ = BitBlt(
             hdc,
@@ -1280,30 +1657,30 @@ mod windows_editor {
         match state.tool {
             AnnotationTool::Rectangle => Some(AnnotationShape::Rectangle {
                 rect: normalize_rect(start, state.current)?,
-                stroke: Color::RED,
-                stroke_width: 3,
+                stroke: state.color,
+                stroke_width: state.stroke_width,
             }),
             AnnotationTool::Ellipse => Some(AnnotationShape::Ellipse {
                 rect: normalize_rect(start, state.current)?,
-                stroke: Color::RED,
-                stroke_width: 3,
+                stroke: state.color,
+                stroke_width: state.stroke_width,
             }),
             AnnotationTool::Arrow => Some(AnnotationShape::Arrow {
                 start,
                 end: state.current,
-                stroke: Color::RED,
-                stroke_width: 3,
+                stroke: state.color,
+                stroke_width: state.stroke_width,
             }),
             AnnotationTool::Line => Some(AnnotationShape::Line {
                 start,
                 end: state.current,
-                stroke: Color::RED,
-                stroke_width: 3,
+                stroke: state.color,
+                stroke_width: state.stroke_width,
             }),
             AnnotationTool::Brush => Some(AnnotationShape::Brush {
                 points: state.brush_points.clone(),
-                stroke: Color::YELLOW,
-                stroke_width: 4,
+                stroke: state.color,
+                stroke_width: state.stroke_width.max(2),
             }),
             AnnotationTool::Mosaic => Some(AnnotationShape::Mosaic {
                 rect: normalize_rect(start, state.current)?,
@@ -1321,7 +1698,7 @@ mod windows_editor {
             state.doc.push(AnnotationShape::Text {
                 origin,
                 text: state.text_buffer.clone(),
-                color: Color::RED,
+                color: state.color,
                 font_size: 22,
             });
         }
@@ -1386,8 +1763,8 @@ mod windows_editor {
         let mut point = POINT::default();
         let _ = GetCursorPos(&mut point);
         let x = ((point.x - window_origin_x(hwnd)) as f32 / state.scale).round() as i32;
-        let y = ((point.y - window_origin_y(hwnd) - TOOLBAR_HEIGHT) as f32 / state.scale).round()
-            as i32;
+        let y = ((point.y - window_origin_y(hwnd) - state.toolbar_height) as f32 / state.scale)
+            .round() as i32;
         Point {
             x: x.clamp(0, state.image.width.saturating_sub(1) as i32),
             y: y.clamp(0, state.image.height.saturating_sub(1) as i32),
@@ -1409,13 +1786,13 @@ mod windows_editor {
     fn scaled_point(state: &EditorState, point: Point) -> Point {
         Point {
             x: (point.x as f32 * state.scale).round() as i32,
-            y: TOOLBAR_HEIGHT + (point.y as f32 * state.scale).round() as i32,
+            y: state.toolbar_height + (point.y as f32 * state.scale).round() as i32,
         }
     }
 
     fn scaled_rect(state: &EditorState, rect: Rect) -> RECT {
         let left = (rect.x as f32 * state.scale).round() as i32;
-        let top = TOOLBAR_HEIGHT + (rect.y as f32 * state.scale).round() as i32;
+        let top = state.toolbar_height + (rect.y as f32 * state.scale).round() as i32;
         RECT {
             left,
             top,

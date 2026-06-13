@@ -1,15 +1,56 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>capture toolbar</title>
   </head>
   <body>
-    <div class="toolbar">
-      <button data-action="confirm">OK</button>
-      <button data-action="pin">Pin</button>
-      <button data-action="cancel">Cancel</button>
+    <div class="annot-toolbar">
+      <div class="group tools">
+        <button class="tool" data-tool="rectangle" title="矩形">▭</button>
+        <button class="tool" data-tool="ellipse" title="椭圆">◯</button>
+        <button class="tool" data-tool="arrow" title="箭头">↗</button>
+        <button class="tool" data-tool="line" title="直线">／</button>
+        <button class="tool" data-tool="brush" title="画笔">✎</button>
+        <button class="tool" data-tool="text" title="文字">T</button>
+        <button class="tool" data-tool="mosaic" title="马赛克">▦</button>
+        <button class="tool" data-tool="number" title="序号">①</button>
+      </div>
+
+      <div class="sep"></div>
+
+      <div class="group colors">
+        <button class="swatch active" data-color="#FF4040" style="background:#FF4040"></button>
+        <button class="swatch" data-color="#FFD640" style="background:#FFD640"></button>
+        <button class="swatch" data-color="#40C040" style="background:#40C040"></button>
+        <button class="swatch" data-color="#4080FF" style="background:#4080FF"></button>
+        <button class="swatch" data-color="#141414" style="background:#141414"></button>
+        <input type="color" id="color-pick" value="#ff4040" title="自定义颜色" />
+      </div>
+
+      <div class="sep"></div>
+
+      <div class="group width">
+        <input type="range" id="width" min="1" max="20" value="3" title="粗细" />
+      </div>
+
+      <div class="sep"></div>
+
+      <div class="group history">
+        <button class="act" data-action="undo" title="撤销">↶</button>
+        <button class="act" data-action="redo" title="重做">↷</button>
+        <button class="act" data-action="clear" title="清除">🗑</button>
+      </div>
+
+      <div class="sep"></div>
+
+      <div class="group finish">
+        <button class="act save" data-action="save" title="保存到桌面">保存</button>
+        <button class="act pin" data-action="pin" title="贴到桌面">Pin</button>
+        <button class="act cancel" data-action="cancel" title="取消">取消</button>
+        <button class="act confirm" data-action="confirm" title="完成">完成</button>
+      </div>
     </div>
     <script type="module" src="/src/toolbar.ts"></script>
   </body>

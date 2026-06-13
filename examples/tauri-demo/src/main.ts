@@ -204,6 +204,14 @@ async function pinSelection() {
   });
 }
 
+async function annotateSelection() {
+  if (!currentSelection?.base64Png) { message = "无截图可标注"; render(); return; }
+  await run(async () => {
+    await invoke_demo<void>("annotate_image_demo", { base64Image: currentSelection?.base64Png });
+    message = "标注中：在悬浮工具栏选择工具，在编辑器窗口绘制";
+  });
+}
+
 async function copySelection() {
   if (!currentSelection?.base64Png) { message = "No selection to copy"; render(); return; }
   await run(async () => {
@@ -312,6 +320,7 @@ function tabsHtml(): string {
 function captureTabHtml(): string {
   const previewHtml = currentSelection?.base64Png
     ? `<div class="preview-toolbar">
+        <button data-action="annotate-selection" ${busy ? "disabled" : ""}>标注</button>
         <button data-action="pin-selection" ${busy ? "disabled" : ""}>贴到桌面</button>
         <button data-action="copy-selection" ${busy ? "disabled" : ""}>复制</button>
         <button data-action="clear-selection">清除</button>
@@ -495,6 +504,7 @@ root.addEventListener("click", (event) => {
   if (busy) return;
 
   if (action === "select-region") void selectRegion();
+  else if (action === "annotate-selection") void annotateSelection();
   else if (action === "capture-fullscreen") void captureFullscreen();
   else if (action === "capture-monitor") void captureMonitor(id);
   else if (action === "pin-selection") void pinSelection();

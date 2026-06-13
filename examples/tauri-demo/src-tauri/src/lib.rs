@@ -10,13 +10,17 @@ use tauri::{
     WebviewWindowBuilder,
 };
 use win_screen_core::overlay::{InteractiveOverlay, SelectionDecision};
-use win_screen_core::{AudioOptions, CapturedImage, Pin, Rect, RecordingTarget, Recorder, RegionIndicator, Screenshot, Size};
+use win_screen_core::{
+    AnnotationCommand, AnnotationEditAction, AnnotationOverlay, AnnotationTool, AudioOptions,
+    CapturedImage, Color, Pin, Rect, Recorder, RecordingTarget, RegionIndicator, Screenshot, Size,
+};
 
 const TOOLBAR_LABEL: &str = "capture-toolbar";
-// Toolbar size in physical pixels — the overlay punches a COLOR_KEY hole of the
-// same size, so we drive the Tauri window with PhysicalSize to stay aligned.
-const TOOLBAR_W: u32 = 240;
-const TOOLBAR_H: u32 = 48;
+// Rich floating toolbar (tools + colors + width + undo/redo + finish), in physical
+// pixels. The selection overlay punches a COLOR_KEY hole of the same size, so we
+// drive the Tauri window with PhysicalSize to stay aligned.
+const TOOLBAR_W: u32 = 600;
+const TOOLBAR_H: u32 = 52;
 
 const EVENT_SELECTION_DONE: &str = "win-screen-demo://selection-done";
 const EVENT_SELECTION_CANCELED: &str = "win-screen-demo://selection-canceled";
@@ -133,12 +137,19 @@ fn start_interactive_capture_flow(
                 return;
             };
 
+            // The overlay already drew any annotations onto `image`. Finish per the
+            // toolbar decision: Pin → desktop pin, Save → PNG on the desktop.
             let mut pinned = false;
             let mut pin_id = None;
             if matches!(decision, SelectionDecision::Pin) {
                 if let Ok(handle) = Pin::from_image(image.clone()) {
                     pinned = true;
                     pin_id = Some(handle.id());
+                }
+            }
+            if matches!(decision, SelectionDecision::Save) {
+                if let Some(path) = desktop_png_path() {
+                    let _ = image.save_png(&path);
                 }
             }
 
@@ -329,18 +340,197 @@ fn stop_recording_demo(app: AppHandle, id: u64) -> Result<String, String> {
     Ok(path_str)
 }
 
-#[tauri::command]
-fn toolbar_decide(options: ToolbarDecisionOptions) -> Result<(), String> {
-    let action = match options.action.as_str() {
-        "pin" => SelectionDecision::Pin,
-        "cancel" => SelectionDecision::Cancel,
-        _ => SelectionDecision::Confirm,
+// ─── Annotation flow ────────────────────────────────────────────────────────────
+
+/// HWND of the running annotation editor, so `annotation_command` can post commands
+/// (set tool/color/width, undo/redo, confirm/pin/save/cancel) straight into it.
+fn annotate_hwnd() -> &'static Mutex<Option<usize>> {
+    static HWND: OnceLock<Mutex<Option<usize>>> = OnceLock::new();
+    HWND.get_or_init(|| Mutex::new(None))
+}
+
+/// Run win-screen-core's annotation editor on `image`. The editor (core) draws the
+/// image and handles the mouse; the floating toolbar is the shared Tauri window
+/// above. On finish, pin / save / hand the annotated image back to the main window.
+/// Used by the preview-area "标注" entry, where there is no live screen region.
+///
+/// Synchronous — runs the editor message loop on the calling thread.
+fn run_annotation_editor(app: AppHandle, image: CapturedImage, anchor: Option<Rect>) {
+    let app_place = app.clone();
+    let app_hide = app.clone();
+    let overlay = AnnotationOverlay {
+        toolbar_size: (TOOLBAR_W, TOOLBAR_H),
+        place_toolbar: Box::new(move |rect: Rect| {
+            if let Some(win) = ensure_toolbar(&app_place) {
+                let _ = win.set_position(PhysicalPosition::new(rect.x, rect.y));
+                let _ = win.set_size(PhysicalSize::new(rect.width, rect.height));
+                let _ = win.show();
+                let _ = win.set_focus();
+            }
+        }),
+        hide_toolbar: Box::new(move || {
+            if let Some(win) = app_hide.get_webview_window(TOOLBAR_LABEL) {
+                let _ = win.hide();
+            }
+        }),
+        on_ready: Box::new(|hwnd: usize| {
+            *annotate_hwnd().lock().unwrap() = Some(hwnd);
+        }),
     };
 
+    let result = win_screen_core::edit_image_with_overlay(image, anchor, overlay);
+
+    // Editor closed — forget the toolbar and editor handle.
+    if let Some(win) = app.get_webview_window(TOOLBAR_LABEL) {
+        let _ = win.hide();
+    }
+    *annotate_hwnd().lock().unwrap() = None;
+
+    let Ok(Some(edit)) = result else {
+        let _ = app.emit(EVENT_SELECTION_CANCELED, ());
+        return;
+    };
+
+    let mut pinned = false;
+    let mut pin_id = None;
+    if matches!(edit.action, AnnotationEditAction::Pin) {
+        if let Ok(handle) = Pin::from_image(edit.image.clone()) {
+            pinned = true;
+            pin_id = Some(handle.id());
+        }
+    }
+    if matches!(edit.action, AnnotationEditAction::Save) {
+        if let Some(path) = desktop_png_path() {
+            let _ = edit.image.save_png(&path);
+        }
+    }
+
+    let base64_png = encode_png_base64(&edit.image).ok();
+    let rect = anchor.unwrap_or(Rect {
+        x: 0,
+        y: 0,
+        width: edit.image.width,
+        height: edit.image.height,
+    });
+    let payload = InteractiveSelectionResponse {
+        rect,
+        width: edit.image.width,
+        height: edit.image.height,
+        base64_png,
+        pinned,
+        pin_id,
+    };
+    let _ = app.emit(EVENT_SELECTION_DONE, payload);
+}
+
+/// `~/Desktop/annotation-<unix_ts>.png`, or None if the home dir can't be resolved.
+fn desktop_png_path() -> Option<PathBuf> {
+    let home = std::env::var_os("USERPROFILE")?;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut path = PathBuf::from(home);
+    path.push("Desktop");
+    path.push(format!("annotation-{ts}.png"));
+    Some(path)
+}
+
+/// Open the annotation editor for an arbitrary captured image (base64 PNG). Used by
+/// the preview-toolbar "标注" button so fullscreen/monitor captures can be annotated.
+#[tauri::command]
+fn annotate_image_demo(app: AppHandle, base64_image: String) -> Result<(), String> {
+    if capture_running().swap(true, Ordering::SeqCst) {
+        return Err("a capture or annotation flow is already running".to_string());
+    }
+    thread::Builder::new()
+        .name("win-screen-demo-annotate".to_string())
+        .spawn(move || {
+            let _guard = CaptureRunningGuard;
+            let bytes = match base64::engine::general_purpose::STANDARD.decode(base64_image) {
+                Ok(b) => b,
+                Err(_) => return,
+            };
+            let Ok(decoded) = image::load_from_memory(&bytes) else {
+                return;
+            };
+            let rgba = decoded.to_rgba8();
+            let Ok(captured) = CapturedImage::new(rgba.width(), rgba.height(), rgba.into_raw())
+            else {
+                return;
+            };
+            run_annotation_editor(app, captured, None);
+        })
+        .map_err(|err| {
+            capture_running().store(false, Ordering::SeqCst);
+            err.to_string()
+        })?;
+    Ok(())
+}
+
+/// Drive the active annotation surface from the floating Tauri toolbar. Routes to the
+/// selection overlay when one is running, otherwise the standalone editor (preview-area
+/// entry). `action` is one of: `tool:<rectangle|ellipse|arrow|line|brush|text|mosaic|number>`,
+/// `tool:none` (deselect), `color:#RRGGBB`, `width:<n>`, `undo`, `redo`, `clear`,
+/// `confirm`, `pin`, `save`, `cancel`.
+#[tauri::command]
+fn annotation_command(options: ToolbarDecisionOptions) -> Result<(), String> {
+    let action = options.action;
+    let command = if let Some(tool) = action.strip_prefix("tool:") {
+        if tool == "none" {
+            AnnotationCommand::DeselectTool
+        } else {
+            let tool = match tool {
+                "rectangle" => AnnotationTool::Rectangle,
+                "ellipse" => AnnotationTool::Ellipse,
+                "arrow" => AnnotationTool::Arrow,
+                "line" => AnnotationTool::Line,
+                "brush" => AnnotationTool::Brush,
+                "text" => AnnotationTool::Text,
+                "mosaic" => AnnotationTool::Mosaic,
+                "number" => AnnotationTool::Number,
+                other => return Err(format!("unknown tool: {other}")),
+            };
+            AnnotationCommand::SetTool(tool)
+        }
+    } else if let Some(hex) = action.strip_prefix("color:") {
+        AnnotationCommand::SetColor(parse_hex_color(hex)?)
+    } else if let Some(width) = action.strip_prefix("width:") {
+        let width: u32 = width.parse().map_err(|_| "invalid width".to_string())?;
+        AnnotationCommand::SetStrokeWidth(width)
+    } else {
+        match action.as_str() {
+            "undo" => AnnotationCommand::Undo,
+            "redo" => AnnotationCommand::Redo,
+            "clear" => AnnotationCommand::Clear,
+            "confirm" => AnnotationCommand::Confirm,
+            "pin" => AnnotationCommand::Pin,
+            "save" => AnnotationCommand::Save,
+            "cancel" => AnnotationCommand::Cancel,
+            other => return Err(format!("unknown annotation action: {other}")),
+        }
+    };
+
+    // The selection overlay and the standalone editor are mutually exclusive
+    // (capture_running guards both). Prefer the overlay when it is up.
     if let Some(hwnd) = *overlay_hwnd().lock().expect("overlay hwnd poisoned") {
-        win_screen_core::overlay::post_decision(hwnd, action);
+        win_screen_core::post_overlay_command(hwnd, command);
+    } else if let Some(hwnd) = *annotate_hwnd().lock().expect("annotate hwnd poisoned") {
+        win_screen_core::post_annotation_command(hwnd, command);
     }
     Ok(())
+}
+
+/// Parse `#RRGGBB` (or `RRGGBB`) into an opaque Color.
+fn parse_hex_color(hex: &str) -> Result<Color, String> {
+    let hex = hex.trim_start_matches('#');
+    if hex.len() != 6 {
+        return Err(format!("invalid color: {hex}"));
+    }
+    let r = u8::from_str_radix(&hex[0..2], 16).map_err(|_| "invalid color".to_string())?;
+    let g = u8::from_str_radix(&hex[2..4], 16).map_err(|_| "invalid color".to_string())?;
+    let b = u8::from_str_radix(&hex[4..6], 16).map_err(|_| "invalid color".to_string())?;
+    Ok(Color { r, g, b, a: 255 })
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -354,7 +544,6 @@ pub fn run() {
             copy_pin,
             close_pin,
             set_pin_opacity,
-            toolbar_decide,
             capture_fullscreen_demo,
             capture_monitor_demo,
             list_monitors_demo,
@@ -363,6 +552,8 @@ pub fn run() {
             select_record_region,
             start_recording_demo,
             stop_recording_demo,
+            annotate_image_demo,
+            annotation_command,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run tauri app");
@@ -381,8 +572,8 @@ fn encode_png_base64(image: &CapturedImage) -> Result<String, String> {
     Ok(base64::engine::general_purpose::STANDARD.encode(png))
 }
 
-/// HWND of the currently running selection overlay, so `toolbar_decide` can post
-/// the decision straight back into its message loop.
+/// HWND of the currently running selection overlay, so `annotation_command` can post
+/// tool/finish commands straight back into its message loop.
 fn overlay_hwnd() -> &'static Mutex<Option<usize>> {
     static HWND: OnceLock<Mutex<Option<usize>>> = OnceLock::new();
     HWND.get_or_init(|| Mutex::new(None))

@@ -5,6 +5,8 @@ pub enum SelectionDecision {
     Confirm,
     Pin,
     Cancel,
+    /// Finish and save the (possibly annotated) region to a file.
+    Save,
 }
 
 /// Configuration for an interactive selection overlay that pairs an *editable*
@@ -52,7 +54,7 @@ where
     #[cfg(windows)]
     {
         let config = windows_overlay::OverlayConfig::with_decide(Box::new(decide));
-        let Some((rect, decision)) = windows_overlay::run_overlay(config)? else {
+        let Some((rect, decision, _doc)) = windows_overlay::run_overlay(config)? else {
             return Ok(None);
         };
         if matches!(decision, SelectionDecision::Cancel) {
@@ -76,13 +78,20 @@ pub fn interactive_capture_selection_with_overlay(
     overlay: InteractiveOverlay,
 ) -> Result<Option<(crate::Rect, CapturedImage, SelectionDecision)>> {
     let config = windows_overlay::OverlayConfig::interactive(overlay);
-    let Some((rect, decision)) = windows_overlay::run_overlay(config)? else {
+    let Some((rect, decision, doc)) = windows_overlay::run_overlay(config)? else {
         return Ok(None);
     };
     if matches!(decision, SelectionDecision::Cancel) {
         return Ok(None);
     }
     let image = capture::capture_region(rect)?;
+    // Annotations are stored in screen-absolute coordinates; map them into the
+    // captured region's local space and composite onto the image.
+    let image = if doc.is_empty() {
+        image
+    } else {
+        doc.render_offset(&image, -rect.x, -rect.y)?
+    };
     Ok(Some((rect, image, decision)))
 }
 
@@ -93,20 +102,32 @@ pub fn post_decision(hwnd: usize, decision: SelectionDecision) {
     windows_overlay::post_decision(hwnd, decision);
 }
 
+/// Post an annotation command (select tool / color / width, undo-redo-clear, or
+/// finish via confirm/pin/save/cancel) to a running interactive overlay. The
+/// overlay does the drawing; the host only sends button presses. Identified by the
+/// HWND delivered through [`InteractiveOverlay::on_ready`].
+#[cfg(windows)]
+pub fn post_overlay_command(hwnd: usize, command: crate::AnnotationCommand) {
+    windows_overlay::post_overlay_command(hwnd, command);
+}
+
 #[cfg(windows)]
 mod windows_overlay {
     use super::SelectionDecision;
+    use crate::annotate::{
+        AnnotationCommand, AnnotationDocument, AnnotationShape, AnnotationTool, Color, Point,
+    };
     use crate::{platform, Rect, Result, WinScreenError};
     use std::ffi::c_void;
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
     use windows::Win32::Graphics::Gdi::{
         AlphaBlend, BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreatePen,
-        CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, GetStockObject,
-        GetWindowDC, InvalidateRect, Rectangle, ReleaseDC, SelectObject, SetBkColor, SetBkMode,
-        SetTextColor, BLACK_BRUSH, BLENDFUNCTION, CAPTUREBLT, DT_CENTER, DT_SINGLELINE,
-        DT_VCENTER, HBITMAP, HBRUSH, HDC, HGDIOBJ, NULL_BRUSH, PAINTSTRUCT, PS_SOLID, SRCCOPY,
-        TRANSPARENT,
+        CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, Ellipse, EndPaint, FillRect,
+        GetStockObject, GetWindowDC, IntersectClipRect, InvalidateRect, LineTo, MoveToEx,
+        Rectangle, ReleaseDC, SelectClipRgn, SelectObject, SetBkColor, SetBkMode, SetTextColor,
+        BLACK_BRUSH, BLENDFUNCTION, CAPTUREBLT, DT_CENTER, DT_SINGLELINE, DT_VCENTER, HBITMAP,
+        HBRUSH, HDC, HGDIOBJ, HRGN, NULL_BRUSH, PAINTSTRUCT, PS_SOLID, SRCCOPY, TRANSPARENT,
     };
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -118,7 +139,7 @@ mod windows_overlay {
         IsWindowVisible, LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassW, SetCursor,
         SetLayeredWindowAttributes, SetWindowLongPtrW, ShowWindow, TranslateMessage, CS_HREDRAW,
         CS_VREDRAW, GWLP_USERDATA, HCURSOR, IDC_CROSS, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS,
-        IDC_SIZENWSE, IDC_SIZEWE, LWA_COLORKEY, MSG, SW_SHOW, WM_DESTROY, WM_ERASEBKGND,
+        IDC_SIZENWSE, IDC_SIZEWE, LWA_COLORKEY, MSG, SW_SHOW, WM_CHAR, WM_DESTROY, WM_ERASEBKGND,
         WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONDOWN,
         WM_SETCURSOR, WM_USER, WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
         WS_POPUP, WS_VISIBLE,
@@ -128,8 +149,11 @@ mod windows_overlay {
     // Rare color used as the transparency key — pixels of this exact color become
     // both invisible and click-through (so the toolbar hole reaches the toolbar).
     const COLOR_KEY: COLORREF = COLORREF(0x00010203);
-    // Custom posted message: wparam encodes decision (0=Confirm, 1=Pin, 2=Cancel).
+    // Custom posted message: wparam encodes decision (0=Confirm, 1=Pin, 2=Cancel, 3=Save).
     const WM_DECIDE_DONE: u32 = WM_USER + 1;
+    // Custom posted message carrying an AnnotationCommand from the host toolbar.
+    // wparam = kind, lparam = payload (tool index / packed RGBA / stroke width).
+    const WM_OVERLAY_CMD: u32 = WM_USER + 2;
     // How much the screen is dimmed outside the selection (0=black .. 255=clear).
     const DIM_ALPHA: u8 = 140;
     // Gap between the selection and the toolbar, and resize-handle sizing.
@@ -221,6 +245,17 @@ mod windows_overlay {
         selection: Option<Rect>,
         hover_win: Option<Rect>, // window auto-highlight before the first drag
         hover_hit: HitZone,
+        // Annotation (drawn directly on the overlay, screen-absolute coords).
+        doc: AnnotationDocument,
+        active_tool: Option<AnnotationTool>, // None = selection mode, Some = annotating
+        color: Color,
+        stroke_width: u32,
+        draw_start: Option<Point>, // shape drag start (screen coords)
+        draw_current: Point,       // shape drag current (screen coords)
+        brush_points: Vec<Point>,  // freehand points (screen coords)
+        number: u32,
+        text_origin: Option<Point>, // active text caret (screen coords)
+        text_buffer: String,
         // Outcome.
         result: Option<Rect>,
         decision: SelectionDecision,
@@ -242,7 +277,9 @@ mod windows_overlay {
         cur_ns: HCURSOR,
     }
 
-    pub(super) fn run_overlay(config: OverlayConfig) -> Result<Option<(Rect, SelectionDecision)>> {
+    pub(super) fn run_overlay(
+        config: OverlayConfig,
+    ) -> Result<Option<(Rect, SelectionDecision, AnnotationDocument)>> {
         platform::set_process_dpi_aware().ok();
         let virtual_rect = platform::virtual_screen_rect()?;
         let class_name = wide(CLASS_NAME);
@@ -281,6 +318,16 @@ mod windows_overlay {
             selection: None,
             hover_win: None,
             hover_hit: HitZone::Outside,
+            doc: AnnotationDocument::new(),
+            active_tool: None,
+            color: Color::RED,
+            stroke_width: 3,
+            draw_start: None,
+            draw_current: Point { x: 0, y: 0 },
+            brush_points: Vec::new(),
+            number: 1,
+            text_origin: None,
+            text_buffer: String::new(),
             result: None,
             decision: SelectionDecision::Confirm,
             canceled: false,
@@ -344,7 +391,8 @@ mod windows_overlay {
         if state.canceled {
             Ok(None)
         } else {
-            Ok(state.result.map(|rect| (rect, state.decision)))
+            let doc = std::mem::take(&mut state.doc);
+            Ok(state.result.map(|rect| (rect, state.decision, doc)))
         }
     }
 
@@ -353,6 +401,7 @@ mod windows_overlay {
             SelectionDecision::Confirm => 0,
             SelectionDecision::Pin => 1,
             SelectionDecision::Cancel => 2,
+            SelectionDecision::Save => 3,
         };
         unsafe {
             let _ = PostMessageW(
@@ -361,6 +410,90 @@ mod windows_overlay {
                 WPARAM(code),
                 LPARAM(0),
             );
+        }
+    }
+
+    pub(super) fn post_overlay_command(hwnd: usize, command: AnnotationCommand) {
+        let (kind, payload): (usize, isize) = match command {
+            AnnotationCommand::SetTool(tool) => (0, tool_index(tool) as isize),
+            AnnotationCommand::SetColor(color) => (1, pack_rgba(color) as isize),
+            AnnotationCommand::SetStrokeWidth(width) => (2, width as isize),
+            AnnotationCommand::Undo => (3, 0),
+            AnnotationCommand::Redo => (4, 0),
+            AnnotationCommand::Clear => (5, 0),
+            AnnotationCommand::Confirm => (6, 0),
+            AnnotationCommand::Pin => (7, 0),
+            AnnotationCommand::Save => (8, 0),
+            AnnotationCommand::Cancel => (9, 0),
+            AnnotationCommand::DeselectTool => (10, 0),
+        };
+        unsafe {
+            let _ = PostMessageW(
+                HWND(hwnd as *mut c_void),
+                WM_OVERLAY_CMD,
+                WPARAM(kind),
+                LPARAM(payload),
+            );
+        }
+    }
+
+    fn tool_index(tool: AnnotationTool) -> usize {
+        match tool {
+            AnnotationTool::Rectangle => 0,
+            AnnotationTool::Ellipse => 1,
+            AnnotationTool::Arrow => 2,
+            AnnotationTool::Line => 3,
+            AnnotationTool::Brush => 4,
+            AnnotationTool::Text => 5,
+            AnnotationTool::Mosaic => 6,
+            AnnotationTool::Number => 7,
+        }
+    }
+
+    fn tool_from_index(idx: usize) -> Option<AnnotationTool> {
+        Some(match idx {
+            0 => AnnotationTool::Rectangle,
+            1 => AnnotationTool::Ellipse,
+            2 => AnnotationTool::Arrow,
+            3 => AnnotationTool::Line,
+            4 => AnnotationTool::Brush,
+            5 => AnnotationTool::Text,
+            6 => AnnotationTool::Mosaic,
+            7 => AnnotationTool::Number,
+            _ => return None,
+        })
+    }
+
+    fn pack_rgba(color: Color) -> i32 {
+        ((color.r as i32) << 24)
+            | ((color.g as i32) << 16)
+            | ((color.b as i32) << 8)
+            | (color.a as i32)
+    }
+
+    fn unpack_rgba(value: i32) -> Color {
+        Color {
+            r: ((value >> 24) & 0xff) as u8,
+            g: ((value >> 16) & 0xff) as u8,
+            b: ((value >> 8) & 0xff) as u8,
+            a: (value & 0xff) as u8,
+        }
+    }
+
+    fn colorref(color: Color) -> COLORREF {
+        COLORREF(color.r as u32 | ((color.g as u32) << 8) | ((color.b as u32) << 16))
+    }
+
+    /// Clamp a screen point into the selection rect, so drawing stays inside the
+    /// captured region.
+    fn clamp_to_sel(p: POINT, sel: Rect) -> Point {
+        let l = sel.x;
+        let t = sel.y;
+        let r = sel.x + sel.width as i32;
+        let b = sel.y + sel.height as i32;
+        Point {
+            x: p.x.clamp(l, r),
+            y: p.y.clamp(t, b),
         }
     }
 
@@ -402,6 +535,13 @@ mod windows_overlay {
             WM_LBUTTONDOWN => {
                 if let Some(state) = state_ptr.as_mut() {
                     let point = cursor_point();
+                    // Annotation mode: a tool is active → draw on the selection.
+                    if state.interactive {
+                        if let (Some(tool), Some(sel)) = (state.active_tool, state.selection) {
+                            begin_annotation(hwnd, state, tool, sel, point);
+                            return LRESULT(0);
+                        }
+                    }
                     if state.interactive && state.phase == Phase::Editing {
                         if let Some(sel) = state.selection {
                             match hit_test(sel, point) {
@@ -416,6 +556,8 @@ mod windows_overlay {
                                     state.orig_rect = sel;
                                 }
                                 HitZone::Outside => {
+                                    // Re-selecting a new region clears any annotations.
+                                    state.doc.clear();
                                     state.drag = Drag::NewSelection;
                                     state.start = Some(point);
                                     state.current = point;
@@ -442,6 +584,18 @@ mod windows_overlay {
             WM_MOUSEMOVE => {
                 if let Some(state) = state_ptr.as_mut() {
                     let point = cursor_point();
+                    // Annotation drag in progress.
+                    if state.draw_start.is_some() {
+                        if let Some(sel) = state.selection {
+                            let p = clamp_to_sel(point, sel);
+                            state.draw_current = p;
+                            if matches!(state.active_tool, Some(AnnotationTool::Brush)) {
+                                state.brush_points.push(p);
+                            }
+                            let _ = InvalidateRect(hwnd, None, false);
+                        }
+                        return LRESULT(0);
+                    }
                     match state.drag {
                         Drag::NewSelection => {
                             state.current = point;
@@ -477,6 +631,20 @@ mod windows_overlay {
             WM_LBUTTONUP => {
                 if let Some(state) = state_ptr.as_mut() {
                     let point = cursor_point();
+                    // Finish an annotation drag.
+                    if state.draw_start.is_some() {
+                        if let Some(sel) = state.selection {
+                            state.draw_current = clamp_to_sel(point, sel);
+                        }
+                        if let Some(shape) = overlay_preview_shape(state) {
+                            state.doc.push(shape);
+                        }
+                        state.draw_start = None;
+                        state.brush_points.clear();
+                        let _ = ReleaseCapture();
+                        let _ = InvalidateRect(hwnd, None, false);
+                        return LRESULT(0);
+                    }
                     match state.drag {
                         Drag::Move | Drag::Resize(_) => {
                             state.drag = Drag::None;
@@ -532,6 +700,10 @@ mod windows_overlay {
             }
             WM_SETCURSOR => {
                 if let Some(state) = state_ptr.as_ref() {
+                    if state.active_tool.is_some() {
+                        SetCursor(state.cur_cross);
+                        return LRESULT(1);
+                    }
                     let zone = match state.drag {
                         Drag::Resize(h) => HitZone::Handle(h),
                         Drag::Move => HitZone::Inside,
@@ -558,8 +730,37 @@ mod windows_overlay {
                     return LRESULT(0);
                 }
             }
+            WM_CHAR => {
+                if let Some(state) = state_ptr.as_mut() {
+                    if state.text_origin.is_some() {
+                        match char::from_u32(wparam.0 as u32) {
+                            Some('\u{8}') => {
+                                state.text_buffer.pop();
+                            }
+                            Some(ch) if !ch.is_control() => state.text_buffer.push(ch),
+                            _ => {}
+                        }
+                        let _ = InvalidateRect(hwnd, None, false);
+                        return LRESULT(0);
+                    }
+                }
+            }
             WM_KEYDOWN => {
                 if let Some(state) = state_ptr.as_mut() {
+                    // While typing, ESC cancels just the text and ENTER commits it.
+                    if state.text_origin.is_some() {
+                        if wparam.0 == VK_ESCAPE.0 as usize {
+                            state.text_origin = None;
+                            state.text_buffer.clear();
+                            let _ = InvalidateRect(hwnd, None, false);
+                            return LRESULT(0);
+                        }
+                        if wparam.0 == VK_RETURN.0 as usize {
+                            commit_text(state);
+                            let _ = InvalidateRect(hwnd, None, false);
+                            return LRESULT(0);
+                        }
+                    }
                     if wparam.0 == VK_ESCAPE.0 as usize {
                         state.canceled = true;
                         let _ = DestroyWindow(hwnd);
@@ -593,6 +794,7 @@ mod windows_overlay {
                     state.decision = match wparam.0 {
                         1 => SelectionDecision::Pin,
                         2 => SelectionDecision::Cancel,
+                        3 => SelectionDecision::Save,
                         _ => SelectionDecision::Confirm,
                     };
                     if matches!(state.decision, SelectionDecision::Cancel) {
@@ -604,6 +806,62 @@ mod windows_overlay {
                     let _ = DestroyWindow(hwnd);
                 }
                 return LRESULT(0);
+            }
+            WM_OVERLAY_CMD => {
+                if let Some(state) = state_ptr.as_mut() {
+                    let finish = |state: &mut OverlayState, decision: SelectionDecision| {
+                        state.decision = decision;
+                        if state.result.is_none() {
+                            state.result = state.selection;
+                        }
+                    };
+                    match wparam.0 {
+                        0 => {
+                            if let Some(tool) = tool_from_index(lparam.0 as usize) {
+                                state.active_tool = Some(tool);
+                            }
+                        }
+                        10 => {
+                            commit_text(state);
+                            state.active_tool = None;
+                        }
+                        1 => state.color = unpack_rgba(lparam.0 as i32),
+                        2 => state.stroke_width = (lparam.0 as u32).max(1),
+                        3 => {
+                            state.doc.undo();
+                        }
+                        4 => {
+                            state.doc.redo();
+                        }
+                        5 => state.doc.clear(),
+                        6 => {
+                            commit_text(state);
+                            finish(state, SelectionDecision::Confirm);
+                            let _ = DestroyWindow(hwnd);
+                            return LRESULT(0);
+                        }
+                        7 => {
+                            commit_text(state);
+                            finish(state, SelectionDecision::Pin);
+                            let _ = DestroyWindow(hwnd);
+                            return LRESULT(0);
+                        }
+                        8 => {
+                            commit_text(state);
+                            finish(state, SelectionDecision::Save);
+                            let _ = DestroyWindow(hwnd);
+                            return LRESULT(0);
+                        }
+                        9 => {
+                            state.canceled = true;
+                            let _ = DestroyWindow(hwnd);
+                            return LRESULT(0);
+                        }
+                        _ => {}
+                    }
+                    let _ = InvalidateRect(hwnd, None, false);
+                    return LRESULT(0);
+                }
             }
             WM_PAINT => {
                 if let Some(state) = state_ptr.as_ref() {
@@ -798,6 +1056,265 @@ mod windows_overlay {
         None
     }
 
+    unsafe fn begin_annotation(
+        hwnd: HWND,
+        state: &mut OverlayState,
+        tool: AnnotationTool,
+        sel: Rect,
+        cursor: POINT,
+    ) {
+        let p = clamp_to_sel(cursor, sel);
+        match tool {
+            AnnotationTool::Text => {
+                commit_text(state);
+                state.text_origin = Some(p);
+                state.text_buffer.clear();
+            }
+            AnnotationTool::Number => {
+                state.doc.push(AnnotationShape::Number {
+                    center: p,
+                    value: state.number,
+                    fill: state.color,
+                    text: Color::WHITE,
+                });
+                state.number += 1;
+            }
+            _ => {
+                state.draw_start = Some(p);
+                state.draw_current = p;
+                state.brush_points.clear();
+                state.brush_points.push(p);
+                SetCapture(hwnd);
+            }
+        }
+        let _ = InvalidateRect(hwnd, None, false);
+    }
+
+    fn commit_text(state: &mut OverlayState) {
+        let Some(origin) = state.text_origin.take() else {
+            return;
+        };
+        if !state.text_buffer.trim().is_empty() {
+            state.doc.push(AnnotationShape::Text {
+                origin,
+                text: state.text_buffer.clone(),
+                color: state.color,
+                font_size: 22,
+            });
+        }
+        state.text_buffer.clear();
+    }
+
+    fn norm_rect(a: Point, b: Point) -> Option<Rect> {
+        let left = a.x.min(b.x);
+        let top = a.y.min(b.y);
+        let right = a.x.max(b.x);
+        let bottom = a.y.max(b.y);
+        let width = u32::try_from(right - left).ok()?;
+        let height = u32::try_from(bottom - top).ok()?;
+        if width < 2 || height < 2 {
+            return None;
+        }
+        Some(Rect {
+            x: left,
+            y: top,
+            width,
+            height,
+        })
+    }
+
+    fn overlay_preview_shape(state: &OverlayState) -> Option<AnnotationShape> {
+        let start = state.draw_start?;
+        let tool = state.active_tool?;
+        let current = state.draw_current;
+        match tool {
+            AnnotationTool::Rectangle => Some(AnnotationShape::Rectangle {
+                rect: norm_rect(start, current)?,
+                stroke: state.color,
+                stroke_width: state.stroke_width,
+            }),
+            AnnotationTool::Ellipse => Some(AnnotationShape::Ellipse {
+                rect: norm_rect(start, current)?,
+                stroke: state.color,
+                stroke_width: state.stroke_width,
+            }),
+            AnnotationTool::Arrow => Some(AnnotationShape::Arrow {
+                start,
+                end: current,
+                stroke: state.color,
+                stroke_width: state.stroke_width,
+            }),
+            AnnotationTool::Line => Some(AnnotationShape::Line {
+                start,
+                end: current,
+                stroke: state.color,
+                stroke_width: state.stroke_width,
+            }),
+            AnnotationTool::Brush => Some(AnnotationShape::Brush {
+                points: state.brush_points.clone(),
+                stroke: state.color,
+                stroke_width: state.stroke_width.max(2),
+            }),
+            AnnotationTool::Mosaic => Some(AnnotationShape::Mosaic {
+                rect: norm_rect(start, current)?,
+                block_size: 12,
+            }),
+            AnnotationTool::Text | AnnotationTool::Number => None,
+        }
+    }
+
+    fn lp(vr: Rect, p: Point) -> POINT {
+        POINT {
+            x: p.x - vr.x,
+            y: p.y - vr.y,
+        }
+    }
+
+    fn lr(vr: Rect, r: Rect) -> RECT {
+        let left = r.x - vr.x;
+        let top = r.y - vr.y;
+        RECT {
+            left,
+            top,
+            right: left + r.width as i32,
+            bottom: top + r.height as i32,
+        }
+    }
+
+    /// Draw a single shape onto the overlay (1:1, screen→client local coords). This
+    /// is a live preview; the final pixels are composited by `AnnotationDocument`.
+    unsafe fn draw_shape_overlay(hdc: HDC, vr: Rect, shape: &AnnotationShape) {
+        match shape {
+            AnnotationShape::Rectangle {
+                rect,
+                stroke,
+                stroke_width,
+            } => {
+                let rect = lr(vr, *rect);
+                let pen = CreatePen(PS_SOLID, *stroke_width as i32, colorref(*stroke));
+                let old_pen = SelectObject(hdc, HGDIOBJ(pen.0));
+                let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+                let _ = Rectangle(hdc, rect.left, rect.top, rect.right, rect.bottom);
+                SelectObject(hdc, old_brush);
+                SelectObject(hdc, old_pen);
+                let _ = DeleteObject(HGDIOBJ(pen.0));
+            }
+            AnnotationShape::Ellipse {
+                rect,
+                stroke,
+                stroke_width,
+            } => {
+                let rect = lr(vr, *rect);
+                let pen = CreatePen(PS_SOLID, *stroke_width as i32, colorref(*stroke));
+                let old_pen = SelectObject(hdc, HGDIOBJ(pen.0));
+                let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+                let _ = Ellipse(hdc, rect.left, rect.top, rect.right, rect.bottom);
+                SelectObject(hdc, old_brush);
+                SelectObject(hdc, old_pen);
+                let _ = DeleteObject(HGDIOBJ(pen.0));
+            }
+            AnnotationShape::Arrow {
+                start,
+                end,
+                stroke,
+                stroke_width,
+            }
+            | AnnotationShape::Line {
+                start,
+                end,
+                stroke,
+                stroke_width,
+            } => {
+                let s = lp(vr, *start);
+                let e = lp(vr, *end);
+                let pen = CreatePen(PS_SOLID, *stroke_width as i32, colorref(*stroke));
+                let old_pen = SelectObject(hdc, HGDIOBJ(pen.0));
+                let _ = MoveToEx(hdc, s.x, s.y, None);
+                let _ = LineTo(hdc, e.x, e.y);
+                SelectObject(hdc, old_pen);
+                let _ = DeleteObject(HGDIOBJ(pen.0));
+            }
+            AnnotationShape::Brush {
+                points,
+                stroke,
+                stroke_width,
+            } => {
+                if points.len() < 2 {
+                    return;
+                }
+                let pen = CreatePen(PS_SOLID, *stroke_width as i32, colorref(*stroke));
+                let old_pen = SelectObject(hdc, HGDIOBJ(pen.0));
+                let first = lp(vr, points[0]);
+                let _ = MoveToEx(hdc, first.x, first.y, None);
+                for p in &points[1..] {
+                    let p = lp(vr, *p);
+                    let _ = LineTo(hdc, p.x, p.y);
+                }
+                SelectObject(hdc, old_pen);
+                let _ = DeleteObject(HGDIOBJ(pen.0));
+            }
+            AnnotationShape::Text {
+                origin,
+                text,
+                color,
+                ..
+            } => draw_text_overlay(hdc, vr, *origin, text, *color),
+            AnnotationShape::Mosaic { rect, .. } => {
+                let rect = lr(vr, *rect);
+                let pen = CreatePen(PS_SOLID, 2, COLORREF(0x0000D7FF));
+                let old_pen = SelectObject(hdc, HGDIOBJ(pen.0));
+                let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+                let _ = Rectangle(hdc, rect.left, rect.top, rect.right, rect.bottom);
+                SelectObject(hdc, old_brush);
+                SelectObject(hdc, old_pen);
+                let _ = DeleteObject(HGDIOBJ(pen.0));
+            }
+            AnnotationShape::Number {
+                center,
+                value,
+                fill,
+                text,
+            } => {
+                let p = lp(vr, *center);
+                let rect = RECT {
+                    left: p.x - 12,
+                    top: p.y - 12,
+                    right: p.x + 12,
+                    bottom: p.y + 12,
+                };
+                let brush = CreateSolidBrush(colorref(*fill));
+                let old_brush = SelectObject(hdc, HGDIOBJ(brush.0));
+                let _ = Ellipse(hdc, rect.left, rect.top, rect.right, rect.bottom);
+                SelectObject(hdc, old_brush);
+                let _ = DeleteObject(HGDIOBJ(brush.0));
+                let mut label = wide(&value.to_string());
+                let mut text_rect = rect;
+                SetBkMode(hdc, TRANSPARENT);
+                SetTextColor(hdc, colorref(*text));
+                let _ = DrawTextW(
+                    hdc,
+                    &mut label,
+                    &mut text_rect,
+                    DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+                );
+            }
+        }
+    }
+
+    unsafe fn draw_text_overlay(hdc: HDC, vr: Rect, origin: Point, text: &str, color: Color) {
+        let p = lp(vr, origin);
+        let mut rect = RECT {
+            left: p.x,
+            top: p.y,
+            right: vr.width as i32,
+            bottom: vr.height as i32,
+        };
+        let mut wtext = wide(if text.is_empty() { "|" } else { text });
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, colorref(color));
+        let _ = DrawTextW(hdc, &mut wtext, &mut rect, DT_SINGLELINE);
+    }
+
     unsafe fn paint(hwnd: HWND, state: &OverlayState) {
         let mut ps = PAINTSTRUCT::default();
         let hdc = BeginPaint(hwnd, &mut ps);
@@ -837,6 +1354,20 @@ mod windows_overlay {
                 bottom: ly + sh,
             };
 
+            // 3b. Annotations, clipped to the selection.
+            let vr = state.virtual_rect;
+            let _ = IntersectClipRect(mem_dc, local.left, local.top, local.right, local.bottom);
+            for shape in state.doc.shapes() {
+                draw_shape_overlay(mem_dc, vr, shape);
+            }
+            if let Some(shape) = overlay_preview_shape(state) {
+                draw_shape_overlay(mem_dc, vr, &shape);
+            }
+            if let Some(origin) = state.text_origin {
+                draw_text_overlay(mem_dc, vr, origin, &state.text_buffer, state.color);
+            }
+            SelectClipRgn(mem_dc, HRGN::default());
+
             let is_new = matches!(state.drag, Drag::NewSelection);
             let pen_color = if is_new {
                 COLORREF(0x0000D7FF)
@@ -849,14 +1380,15 @@ mod windows_overlay {
                 && state.phase == Phase::Editing
                 && state.selection.is_some()
                 && !is_new;
-            if editing_idle {
+            // Resize handles only make sense in selection mode (no active tool).
+            if editing_idle && state.active_tool.is_none() {
                 draw_handles(mem_dc, &local);
             }
 
             draw_size_label(mem_dc, &local, sel.width, sel.height);
 
-            // 4. Toolbar hole — only while idle in the editing phase.
-            if editing_idle && matches!(state.drag, Drag::None) {
+            // 4. Toolbar hole — only while idle (not dragging / not drawing).
+            if editing_idle && matches!(state.drag, Drag::None) && state.draw_start.is_none() {
                 let tr = toolbar_rect(state, sel);
                 let hole = RECT {
                     left: tr.x - state.virtual_rect.x,
