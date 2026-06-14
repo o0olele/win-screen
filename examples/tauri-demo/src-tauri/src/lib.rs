@@ -19,7 +19,7 @@ const TOOLBAR_LABEL: &str = "capture-toolbar";
 // Rich floating toolbar (tools + colors + width + undo/redo + finish), in physical
 // pixels. The selection overlay punches a COLOR_KEY hole of the same size, so we
 // drive the Tauri window with PhysicalSize to stay aligned.
-const TOOLBAR_W: u32 = 600;
+const TOOLBAR_W: u32 = 1560;
 const TOOLBAR_H: u32 = 52;
 
 const EVENT_SELECTION_DONE: &str = "win-screen-demo://selection-done";
@@ -105,6 +105,7 @@ fn start_interactive_capture_flow(
 
             let app_place = app.clone();
             let app_hide = app.clone();
+            let app_ready = app.clone();
             let overlay = InteractiveOverlay {
                 toolbar_size: (TOOLBAR_W, TOOLBAR_H),
                 place_toolbar: Box::new(move |rect: Rect| {
@@ -112,6 +113,10 @@ fn start_interactive_capture_flow(
                         let _ = win.set_position(PhysicalPosition::new(rect.x, rect.y));
                         let _ = win.set_size(PhysicalSize::new(rect.width, rect.height));
                         let _ = win.show();
+                        // Keep the toolbar above the topmost overlay so its buttons
+                        // stay clickable across the whole annotation session (not just
+                        // the first click through the color-key hole).
+                        let _ = win.set_focus();
                     }
                 }),
                 hide_toolbar: Box::new(move || {
@@ -119,8 +124,11 @@ fn start_interactive_capture_flow(
                         let _ = win.hide();
                     }
                 }),
-                on_ready: Box::new(|hwnd: usize| {
+                on_ready: Box::new(move |hwnd: usize| {
                     *overlay_hwnd().lock().unwrap() = Some(hwnd);
+                    // The toolbar window is reused across captures; clear any stale
+                    // tool/color selection so its UI matches the fresh overlay state.
+                    let _ = app_ready.emit_to(TOOLBAR_LABEL, "toolbar:reset", ());
                 }),
             };
 
@@ -358,6 +366,7 @@ fn annotate_hwnd() -> &'static Mutex<Option<usize>> {
 fn run_annotation_editor(app: AppHandle, image: CapturedImage, anchor: Option<Rect>) {
     let app_place = app.clone();
     let app_hide = app.clone();
+    let app_ready = app.clone();
     let overlay = AnnotationOverlay {
         toolbar_size: (TOOLBAR_W, TOOLBAR_H),
         place_toolbar: Box::new(move |rect: Rect| {
@@ -373,8 +382,10 @@ fn run_annotation_editor(app: AppHandle, image: CapturedImage, anchor: Option<Re
                 let _ = win.hide();
             }
         }),
-        on_ready: Box::new(|hwnd: usize| {
+        on_ready: Box::new(move |hwnd: usize| {
             *annotate_hwnd().lock().unwrap() = Some(hwnd);
+            // Reused toolbar window — clear stale tool/color from a prior session.
+            let _ = app_ready.emit_to(TOOLBAR_LABEL, "toolbar:reset", ());
         }),
     };
 

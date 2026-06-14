@@ -122,12 +122,13 @@ mod windows_overlay {
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
     use windows::Win32::Graphics::Gdi::{
-        AlphaBlend, BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreatePen,
-        CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, Ellipse, EndPaint, FillRect,
-        GetStockObject, GetWindowDC, IntersectClipRect, InvalidateRect, LineTo, MoveToEx,
-        Rectangle, ReleaseDC, SelectClipRgn, SelectObject, SetBkColor, SetBkMode, SetTextColor,
-        BLACK_BRUSH, BLENDFUNCTION, CAPTUREBLT, DT_CENTER, DT_SINGLELINE, DT_VCENTER, HBITMAP,
-        HBRUSH, HDC, HGDIOBJ, HRGN, NULL_BRUSH, PAINTSTRUCT, PS_SOLID, SRCCOPY, TRANSPARENT,
+        AlphaBlend, BeginPaint, BitBlt, CombineRgn, CreateCompatibleBitmap, CreateCompatibleDC,
+        CreatePen, CreateRectRgn, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, Ellipse,
+        EndPaint, FillRect, GetStockObject, GetWindowDC, IntersectClipRect, InvalidateRect, LineTo,
+        MoveToEx, Rectangle, ReleaseDC, SelectClipRgn, SelectObject, SetBkColor, SetBkMode,
+        SetTextColor, SetWindowRgn, BLACK_BRUSH, BLENDFUNCTION, CAPTUREBLT, DT_CENTER,
+        DT_SINGLELINE, DT_VCENTER, HBITMAP, HBRUSH, HDC, HGDIOBJ, HRGN, NULL_BRUSH, PAINTSTRUCT,
+        PS_SOLID, RGN_DIFF, SRCCOPY, TRANSPARENT,
     };
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -565,6 +566,7 @@ mod windows_overlay {
                             }
                             SetCapture(hwnd);
                             hide_toolbar(state);
+                            clear_toolbar_hole(hwnd);
                             let _ = InvalidateRect(hwnd, None, false);
                             return LRESULT(0);
                         }
@@ -655,6 +657,7 @@ mod windows_overlay {
                                     place(tr);
                                 }
                             }
+                            set_toolbar_hole(hwnd, state);
                             let _ = InvalidateRect(hwnd, None, false);
                         }
                         Drag::NewSelection => {
@@ -681,6 +684,7 @@ mod windows_overlay {
                                     if let Some(place) = &state.place_toolbar {
                                         place(tr);
                                     }
+                                    set_toolbar_hole(hwnd, state);
                                 } else {
                                     state.selection = Some(rect);
                                     state.result = Some(rect);
@@ -1032,6 +1036,35 @@ mod windows_overlay {
             width: tw,
             height: th,
         }
+    }
+
+    /// Carve the toolbar rectangle out of the overlay window so that area is no longer
+    /// part of the window: all mouse input there falls straight through to the floating
+    /// toolbar beneath, regardless of z-order, color-key, or DPI. Window-local (client)
+    /// coordinates, i.e. screen coords minus the virtual-rect origin.
+    unsafe fn set_toolbar_hole(hwnd: HWND, state: &OverlayState) {
+        let Some(sel) = state.selection else {
+            return;
+        };
+        let vr = state.virtual_rect;
+        let tr = toolbar_rect(state, sel);
+        let full = CreateRectRgn(0, 0, vr.width as i32, vr.height as i32);
+        let hole = CreateRectRgn(
+            tr.x - vr.x,
+            tr.y - vr.y,
+            tr.x - vr.x + tr.width as i32,
+            tr.y - vr.y + tr.height as i32,
+        );
+        CombineRgn(full, full, hole, RGN_DIFF);
+        let _ = DeleteObject(HGDIOBJ(hole.0));
+        // The window takes ownership of `full`; do not delete it here.
+        SetWindowRgn(hwnd, full, true);
+    }
+
+    /// Restore the overlay to a solid full-screen window (no hole) — used while the
+    /// toolbar is hidden (during a selection drag/move/resize).
+    unsafe fn clear_toolbar_hole(hwnd: HWND) {
+        SetWindowRgn(hwnd, HRGN::default(), true);
     }
 
     fn active_rect(state: &OverlayState) -> Option<Rect> {

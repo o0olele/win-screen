@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import "./toolbar.css";
 
 // Send one action string to the active annotation surface (the selection overlay,
@@ -51,4 +52,15 @@ width?.addEventListener("input", () => {
 // ESC cancels the whole capture/annotation.
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape") send("cancel");
+});
+
+// A new capture started — the overlay begins in selection mode with no active
+// tool, default color and width. The toolbar window is reused, so reset its UI to
+// match (otherwise a tool from the previous capture would look pre-selected).
+void listen("toolbar:reset", () => {
+  setActive(tools, null);
+  setActive(swatches, swatches[0] ?? null);
+  if (width) width.value = "3";
+  if (colorPick) colorPick.value = "#ff4040";
+  (document.activeElement as HTMLElement | null)?.blur();
 });
