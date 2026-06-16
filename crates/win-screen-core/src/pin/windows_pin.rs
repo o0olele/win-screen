@@ -12,9 +12,8 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, EndPaint, FillRect,
-    GetMonitorInfoW, GetStockObject, InvalidateRect, MonitorFromWindow, SelectObject, StretchBlt,
-    BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP, HBRUSH, HDC, HGDIOBJ, HMONITOR,
-    MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, SRCCOPY, WHITE_BRUSH,
+    GetStockObject, InvalidateRect, SelectObject, StretchBlt, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+    DIB_RGB_COLORS, HBITMAP, HBRUSH, HDC, HGDIOBJ, PAINTSTRUCT, SRCCOPY, WHITE_BRUSH,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
@@ -26,7 +25,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     HTCAPTION, HTCLIENT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, IDC_ARROW, LWA_ALPHA, MSG,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOW, WINDOWPOS, WM_APP, WM_DESTROY,
     WM_EXITSIZEMOVE, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_MOUSEWHEEL, WM_NCHITTEST,
-    WM_NCLBUTTONDOWN, WM_PAINT, WM_RBUTTONDOWN, WM_SIZE, WM_WINDOWPOSCHANGING, WNDCLASSW,
+    WM_NCLBUTTONDOWN, WM_PAINT, WM_SIZE, WM_WINDOWPOSCHANGING, WNDCLASSW,
     WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
 };
 
@@ -53,12 +52,6 @@ struct PinWindowState {
     bitmap: HBITMAP,
     bitmap_dc: HDC,
     opacity: u8,
-    // Fullscreen toggle state.
-    is_fullscreen: bool,
-    pre_fs_x: i32,
-    pre_fs_y: i32,
-    pre_fs_w: i32,
-    pre_fs_h: i32,
 }
 
 pub fn pin_image(image: CapturedImage) -> Result<PinHandle> {
@@ -189,13 +182,9 @@ fn run_pin_window(
         RegisterClassW(&wnd_class);
     }
 
-    let max_w = 720_u32;
-    let max_h = 520_u32;
-    let scale = (max_w as f32 / image.width as f32)
-        .min(max_h as f32 / image.height as f32)
-        .min(1.0);
-    let window_w = (image.width as f32 * scale).round().max(80.0) as i32;
-    let window_h = (image.height as f32 * scale).round().max(60.0) as i32;
+    // Pin the capture at its original pixel size (no down-scaling).
+    let window_w = (image.width as i32).max(80);
+    let window_h = (image.height as i32).max(60);
     let virtual_rect = platform::virtual_screen_rect()?;
 
     let (bitmap, bitmap_dc) = create_bitmap(&image)?;
@@ -205,11 +194,6 @@ fn run_pin_window(
         bitmap,
         bitmap_dc,
         opacity: 255,
-        is_fullscreen: false,
-        pre_fs_x: 0,
-        pre_fs_y: 0,
-        pre_fs_w: window_w,
-        pre_fs_h: window_h,
     });
 
     let hwnd = unsafe {
@@ -306,51 +290,8 @@ unsafe extern "system" fn wnd_proc(
             return LRESULT(0);
         }
         WM_LBUTTONDBLCLK => {
-            if let Some(state) = state_ptr.as_mut() {
-                if state.is_fullscreen {
-                    // Restore to pre-fullscreen position and size.
-                    SetWindowPos(
-                        hwnd,
-                        None,
-                        state.pre_fs_x,
-                        state.pre_fs_y,
-                        state.pre_fs_w,
-                        state.pre_fs_h,
-                        SWP_NOZORDER | SWP_NOACTIVATE,
-                    )
-                    .ok();
-                    state.is_fullscreen = false;
-                } else {
-                    // Save current window rect before going fullscreen.
-                    let mut rect = RECT::default();
-                    GetWindowRect(hwnd, &mut rect).ok();
-                    state.pre_fs_x = rect.left;
-                    state.pre_fs_y = rect.top;
-                    state.pre_fs_w = rect.right - rect.left;
-                    state.pre_fs_h = rect.bottom - rect.top;
-
-                    // Query the monitor that contains the window.
-                    let hmonitor: HMONITOR = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-                    let mut mi = MONITORINFO {
-                        cbSize: size_of::<MONITORINFO>() as u32,
-                        ..Default::default()
-                    };
-                    let _ = GetMonitorInfoW(hmonitor, &mut mi);
-                    let mr = mi.rcMonitor;
-                    SetWindowPos(
-                        hwnd,
-                        None,
-                        mr.left,
-                        mr.top,
-                        mr.right - mr.left,
-                        mr.bottom - mr.top,
-                        SWP_NOZORDER | SWP_NOACTIVATE,
-                    )
-                    .ok();
-                    state.is_fullscreen = true;
-                }
-                return LRESULT(0);
-            }
+            let _ = DestroyWindow(hwnd);
+            return LRESULT(0);
         }
         WM_MOUSEWHEEL => {
             if let Some(state) = state_ptr.as_mut() {
@@ -364,10 +305,6 @@ unsafe extern "system" fn wnd_proc(
                 }
                 return LRESULT(0);
             }
-        }
-        WM_RBUTTONDOWN => {
-            let _ = DestroyWindow(hwnd);
-            return LRESULT(0);
         }
         WM_PIN_SET_OPACITY => {
             let alpha = wparam.0.clamp(26, 255) as u8;

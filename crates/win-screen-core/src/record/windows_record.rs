@@ -179,8 +179,12 @@ fn find_monitor_for_region(rect: &Rect) -> Result<(Monitor, (u32, u32, u32, u32)
     let ex = ((rx2 - mx) as u32).min(mw);
     let ey = ((ry2 - my) as u32).min(mh);
 
-    let crop_w = ex.saturating_sub(sx);
-    let crop_h = ey.saturating_sub(sy);
+    // H.264 requires even dimensions; round the crop down to the nearest even
+    // size (some encoders reject odd width/height and yield an empty file).
+    let crop_w = ex.saturating_sub(sx) & !1;
+    let crop_h = ey.saturating_sub(sy) & !1;
+    let ex = sx + crop_w;
+    let ey = sy + crop_h;
 
     if crop_w == 0 || crop_h == 0 {
         return Err(WinScreenError::Recording("region does not intersect any monitor".into()));
@@ -246,25 +250,35 @@ pub fn start(_id: u64, options: RecordingOptions) -> Result<RecordingEntry> {
     let (stop_tx, stop_rx) = mpsc::channel::<()>();
     let (done_tx, done_rx) = mpsc::channel::<std::result::Result<(), String>>();
 
-    let flags = CaptureFlags {
-        shared: shared.clone(),
-        encoder: encoder.clone(),
-        crop,
+    // Build + start the capture for a given border setting. `monitor` is Copy and
+    // the Arcs are cloned per attempt, so this can be retried.
+    let start_with = |border: DrawBorderSettings| {
+        let flags = CaptureFlags {
+            shared: shared.clone(),
+            encoder: encoder.clone(),
+            crop,
+        };
+        let settings = Settings::new(
+            monitor,
+            CursorCaptureSettings::Default,
+            border,
+            SecondaryWindowSettings::Default,
+            MinimumUpdateIntervalSettings::Default,
+            DirtyRegionSettings::Default,
+            ColorFormat::Bgra8,
+            flags,
+        );
+        ScreenCapture::start_free_threaded(settings)
     };
 
-    let settings = Settings::new(
-        monitor,
-        CursorCaptureSettings::Default,
-        DrawBorderSettings::WithoutBorder,
-        SecondaryWindowSettings::Default,
-        MinimumUpdateIntervalSettings::Default,
-        DirtyRegionSettings::Default,
-        ColorFormat::Bgra8,
-        flags,
-    );
-
-    let control = ScreenCapture::start_free_threaded(settings)
-        .map_err(|e| WinScreenError::Recording(format!("WGC capture start failed: {e}")))?;
+    // Prefer a borderless capture, but older Windows 10 builds can't toggle the
+    // capture border — fall back to the OS default border there (for a cropped
+    // region the border sits at the monitor edge, outside the recorded area).
+    let control = match start_with(DrawBorderSettings::WithoutBorder) {
+        Ok(control) => control,
+        Err(_) => start_with(DrawBorderSettings::Default)
+            .map_err(|e| WinScreenError::Recording(format!("WGC capture start failed: {e}")))?,
+    };
 
     let handler_arc = control.callback();
 
@@ -272,11 +286,18 @@ pub fn start(_id: u64, options: RecordingOptions) -> Result<RecordingEntry> {
     // Audio threads are already stopped before this signal is sent (see stop()).
     std::thread::spawn(move || {
         let _ = stop_rx.recv();
-        let _ = control.stop();
+        // `stop()` joins the capture thread and surfaces any error it ended with
+        // (e.g. an `on_frame_arrived` failure) — don't swallow it, or we'd ship a
+        // silent 0-byte file.
+        let stop_result = control.stop();
         let encoder_arc = handler_arc.lock().encoder.clone();
-        let result = match encoder_arc.lock().unwrap().take() {
+        let finish_result = match encoder_arc.lock().unwrap().take() {
             Some(enc) => enc.finish().map_err(|e| e.to_string()),
             None => Ok(()),
+        };
+        let result = match stop_result {
+            Err(e) => Err(format!("capture thread failed: {e:?}")),
+            Ok(()) => finish_result,
         };
         done_tx.send(result).ok();
     });
@@ -336,6 +357,14 @@ pub fn stop(id: u64) -> Result<PathBuf> {
         .recv()
         .map_err(|_| WinScreenError::Recording("recording channel closed unexpectedly".into()))?
         .map_err(|msg| WinScreenError::Recording(format!("encoder finalisation failed: {msg}")))?;
+
+    // Guard against a silent failure that leaves an empty container — better to
+    // report it than to hand back an unplayable 0-byte file.
+    if std::fs::metadata(&entry.output).map(|m| m.len()).unwrap_or(0) == 0 {
+        return Err(WinScreenError::Recording(
+            "recording produced no data (0 bytes) — the capture delivered no frames".into(),
+        ));
+    }
 
     Ok(entry.output)
 }

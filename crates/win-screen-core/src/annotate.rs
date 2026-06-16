@@ -49,6 +49,12 @@ pub enum AnnotationCommand {
     DeselectTool,
     SetColor(Color),
     SetStrokeWidth(u32),
+    /// Text font size in pixels. Only affects the Text tool.
+    SetFontSize(u32),
+    /// Resize the host toolbar window to this total height (physical px). Used so
+    /// the host can grow/shrink to reveal a contextual options panel. Only the
+    /// selection overlay acts on it; the standalone editor treats it as a no-op.
+    ResizeToolbar(u32),
     Undo,
     Redo,
     Clear,
@@ -56,6 +62,10 @@ pub enum AnnotationCommand {
     Pin,
     Save,
     Cancel,
+    /// Finish the selection and start recording the selected region instead of
+    /// capturing a still. Only meaningful for the selection overlay; the
+    /// standalone editor treats it as a no-op.
+    Record,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -552,12 +562,17 @@ fn draw_line(image: &mut CapturedImage, start: Point, end: Point, color: Color, 
     }
 }
 
-fn draw_arrow_head(image: &mut CapturedImage, start: Point, end: Point, color: Color, width: u32) {
+/// Compute the two wing endpoints of an arrowhead for the segment `start`→`end`.
+/// Returns `None` for a degenerate (near-zero-length) segment. Shared by the
+/// rasterizer ([`draw_arrow_head`]) and the live previews (selection overlay /
+/// standalone editor) so an arrow looks identical on screen and in the saved
+/// image.
+pub(crate) fn arrow_head_wings(start: Point, end: Point, width: u32) -> Option<(Point, Point)> {
     let dx = (end.x - start.x) as f32;
     let dy = (end.y - start.y) as f32;
     let len = (dx * dx + dy * dy).sqrt();
     if len < 2.0 {
-        return;
+        return None;
     }
 
     let ux = dx / len;
@@ -572,8 +587,14 @@ fn draw_arrow_head(image: &mut CapturedImage, start: Point, end: Point, color: C
         x: (end.x as f32 - head_len * (ux - uy * wing)).round() as i32,
         y: (end.y as f32 - head_len * (uy + ux * wing)).round() as i32,
     };
-    draw_line(image, end, left, color, width);
-    draw_line(image, end, right, color, width);
+    Some((left, right))
+}
+
+fn draw_arrow_head(image: &mut CapturedImage, start: Point, end: Point, color: Color, width: u32) {
+    if let Some((left, right)) = arrow_head_wings(start, end, width) {
+        draw_line(image, end, left, color, width);
+        draw_line(image, end, right, color, width);
+    }
 }
 
 fn draw_dot(image: &mut CapturedImage, x: i32, y: i32, color: Color, width: u32) {
@@ -886,8 +907,9 @@ mod windows_text {
 #[cfg(windows)]
 mod windows_editor {
     use super::{
-        normalize_rect, AnnotationCommand, AnnotationDocument, AnnotationEditAction,
-        AnnotationEditResult, AnnotationOverlay, AnnotationShape, AnnotationTool, Color, Point,
+        arrow_head_wings, normalize_rect, AnnotationCommand, AnnotationDocument,
+        AnnotationEditAction, AnnotationEditResult, AnnotationOverlay, AnnotationShape,
+        AnnotationTool, Color, Point,
     };
     use crate::{platform, CapturedImage, Rect, Result, WinScreenError};
     use std::ffi::c_void;
@@ -930,6 +952,7 @@ mod windows_editor {
         tool: AnnotationTool,
         color: Color,
         stroke_width: u32,
+        font_size: u32,
         drawing_start: Option<Point>,
         current: Point,
         brush_points: Vec<Point>,
@@ -995,6 +1018,11 @@ mod windows_editor {
             AnnotationCommand::Pin => (7, 0),
             AnnotationCommand::Save => (8, 0),
             AnnotationCommand::Cancel => (9, 0),
+            AnnotationCommand::SetFontSize(size) => (11, size as isize),
+            // The standalone editor has no resizable host toolbar; ignore.
+            AnnotationCommand::ResizeToolbar(_) => return,
+            // Recording is only meaningful for the live selection overlay.
+            AnnotationCommand::Record => return,
         };
         unsafe {
             let _ = PostMessageW(
@@ -1050,6 +1078,7 @@ mod windows_editor {
             tool: AnnotationTool::Rectangle,
             color: Color::RED,
             stroke_width: 3,
+            font_size: 22,
             drawing_start: None,
             current: Point { x: 0, y: 0 },
             brush_points: Vec::new(),
@@ -1334,6 +1363,7 @@ mod windows_editor {
                         }
                         1 => state.color = unpack_rgba(lparam.0 as i32),
                         2 => state.stroke_width = (lparam.0 as u32).max(1),
+                        11 => state.font_size = (lparam.0 as u32).max(8),
                         3 => {
                             state.doc.undo();
                         }
@@ -1548,13 +1578,7 @@ mod windows_editor {
                 SelectObject(hdc, old_pen);
                 let _ = DeleteObject(HGDIOBJ(pen.0));
             }
-            AnnotationShape::Arrow {
-                start,
-                end,
-                stroke,
-                stroke_width,
-            }
-            | AnnotationShape::Line {
+            AnnotationShape::Line {
                 start,
                 end,
                 stroke,
@@ -1566,6 +1590,32 @@ mod windows_editor {
                 let old_pen = SelectObject(hdc, HGDIOBJ(pen.0));
                 let _ = MoveToEx(hdc, start.x, start.y, None);
                 let _ = windows::Win32::Graphics::Gdi::LineTo(hdc, end.x, end.y);
+                SelectObject(hdc, old_pen);
+                let _ = DeleteObject(HGDIOBJ(pen.0));
+            }
+            AnnotationShape::Arrow {
+                start,
+                end,
+                stroke,
+                stroke_width,
+            } => {
+                use windows::Win32::Graphics::Gdi::LineTo;
+                let s = scaled_point(state, *start);
+                let e = scaled_point(state, *end);
+                let pen = CreatePen(PS_SOLID, *stroke_width as i32, colorref(*stroke));
+                let old_pen = SelectObject(hdc, HGDIOBJ(pen.0));
+                let _ = MoveToEx(hdc, s.x, s.y, None);
+                let _ = LineTo(hdc, e.x, e.y);
+                // Arrowhead — same geometry as the rasterizer (arrow_head_wings),
+                // so the preview matches the final image.
+                if let Some((left, right)) = arrow_head_wings(*start, *end, *stroke_width) {
+                    let l = scaled_point(state, left);
+                    let r = scaled_point(state, right);
+                    let _ = MoveToEx(hdc, e.x, e.y, None);
+                    let _ = LineTo(hdc, l.x, l.y);
+                    let _ = MoveToEx(hdc, e.x, e.y, None);
+                    let _ = LineTo(hdc, r.x, r.y);
+                }
                 SelectObject(hdc, old_pen);
                 let _ = DeleteObject(HGDIOBJ(pen.0));
             }
@@ -1699,7 +1749,7 @@ mod windows_editor {
                 origin,
                 text: state.text_buffer.clone(),
                 color: state.color,
-                font_size: 22,
+                font_size: state.font_size,
             });
         }
         state.text_buffer.clear();

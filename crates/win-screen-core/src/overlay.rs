@@ -7,6 +7,8 @@ pub enum SelectionDecision {
     Cancel,
     /// Finish and save the (possibly annotated) region to a file.
     Save,
+    /// Finish the selection and record the selected region (no still capture).
+    Record,
 }
 
 /// Configuration for an interactive selection overlay that pairs an *editable*
@@ -23,9 +25,19 @@ pub struct InteractiveOverlay {
     /// hole of exactly this size and asks the host to position the toolbar there,
     /// so both sides stay aligned regardless of DPI scaling.
     pub toolbar_size: (u32, u32),
+    /// Maximum toolbar height (physical px) the host may grow to when it reveals a
+    /// contextual options panel. Used only to decide whether the toolbar is placed
+    /// below or above the selection, so the strip stays anchored as the panel
+    /// opens/closes. The actual height is driven at runtime via
+    /// [`AnnotationCommand::ResizeToolbar`].
+    pub toolbar_expanded_height: u32,
     /// Move the toolbar to the given screen rect and show it. Called when the
     /// selection is first committed and after every move/resize.
     pub place_toolbar: Box<dyn Fn(crate::Rect) + Send>,
+    /// Resize/reposition the toolbar window *without* showing or focusing it.
+    /// Called when [`AnnotationCommand::ResizeToolbar`] grows/shrinks the toolbar
+    /// so it does not steal focus from in-overlay text editing.
+    pub resize_toolbar: Box<dyn Fn(crate::Rect) + Send>,
     /// Temporarily hide the toolbar while a drag (move/resize/re-select) is in
     /// progress.
     pub hide_toolbar: Box<dyn Fn() + Send>,
@@ -115,7 +127,8 @@ pub fn post_overlay_command(hwnd: usize, command: crate::AnnotationCommand) {
 mod windows_overlay {
     use super::SelectionDecision;
     use crate::annotate::{
-        AnnotationCommand, AnnotationDocument, AnnotationShape, AnnotationTool, Color, Point,
+        arrow_head_wings, AnnotationCommand, AnnotationDocument, AnnotationShape, AnnotationTool,
+        Color, Point,
     };
     use crate::{platform, Rect, Result, WinScreenError};
     use std::ffi::c_void;
@@ -199,7 +212,9 @@ mod windows_overlay {
         interactive: bool,
         decide: Option<Box<dyn FnOnce(Rect) -> SelectionDecision + Send>>,
         toolbar_size: (u32, u32),
+        toolbar_expanded_height: u32,
         place_toolbar: Option<Box<dyn Fn(Rect) + Send>>,
+        resize_toolbar: Option<Box<dyn Fn(Rect) + Send>>,
         hide_toolbar: Option<Box<dyn Fn() + Send>>,
         on_ready: Option<Box<dyn Fn(usize) + Send>>,
     }
@@ -212,7 +227,9 @@ mod windows_overlay {
                 interactive: false,
                 decide: Some(decide),
                 toolbar_size: (0, 0),
+                toolbar_expanded_height: 0,
                 place_toolbar: None,
+                resize_toolbar: None,
                 hide_toolbar: None,
                 on_ready: None,
             }
@@ -223,7 +240,9 @@ mod windows_overlay {
                 interactive: true,
                 decide: None,
                 toolbar_size: o.toolbar_size,
+                toolbar_expanded_height: o.toolbar_expanded_height,
                 place_toolbar: Some(o.place_toolbar),
+                resize_toolbar: Some(o.resize_toolbar),
                 hide_toolbar: Some(o.hide_toolbar),
                 on_ready: Some(o.on_ready),
             }
@@ -251,6 +270,7 @@ mod windows_overlay {
         active_tool: Option<AnnotationTool>, // None = selection mode, Some = annotating
         color: Color,
         stroke_width: u32,
+        font_size: u32, // text tool font size (physical px)
         draw_start: Option<Point>, // shape drag start (screen coords)
         draw_current: Point,       // shape drag current (screen coords)
         brush_points: Vec<Point>,  // freehand points (screen coords)
@@ -265,7 +285,13 @@ mod windows_overlay {
         interactive: bool,
         decide: Option<Box<dyn FnOnce(Rect) -> SelectionDecision + Send>>,
         toolbar_size: (u32, u32),
+        // Collapsed (strip-only) and fully-expanded toolbar heights (physical px).
+        // `strip_height` is the initial height; the live height lives in
+        // `toolbar_size.1` and is changed by ResizeToolbar.
+        strip_height: u32,
+        expanded_height: u32,
         place_toolbar: Option<Box<dyn Fn(Rect) + Send>>,
+        resize_toolbar: Option<Box<dyn Fn(Rect) + Send>>,
         hide_toolbar: Option<Box<dyn Fn() + Send>>,
         on_ready: Option<Box<dyn Fn(usize) + Send>>,
         ready_sent: bool,
@@ -323,6 +349,7 @@ mod windows_overlay {
             active_tool: None,
             color: Color::RED,
             stroke_width: 3,
+            font_size: 22,
             draw_start: None,
             draw_current: Point { x: 0, y: 0 },
             brush_points: Vec::new(),
@@ -335,7 +362,10 @@ mod windows_overlay {
             interactive: config.interactive,
             decide: config.decide,
             toolbar_size: config.toolbar_size,
+            strip_height: config.toolbar_size.1,
+            expanded_height: config.toolbar_expanded_height.max(config.toolbar_size.1),
             place_toolbar: config.place_toolbar,
+            resize_toolbar: config.resize_toolbar,
             hide_toolbar: config.hide_toolbar,
             on_ready: config.on_ready,
             ready_sent: false,
@@ -403,6 +433,7 @@ mod windows_overlay {
             SelectionDecision::Pin => 1,
             SelectionDecision::Cancel => 2,
             SelectionDecision::Save => 3,
+            SelectionDecision::Record => 4,
         };
         unsafe {
             let _ = PostMessageW(
@@ -427,6 +458,9 @@ mod windows_overlay {
             AnnotationCommand::Save => (8, 0),
             AnnotationCommand::Cancel => (9, 0),
             AnnotationCommand::DeselectTool => (10, 0),
+            AnnotationCommand::SetFontSize(size) => (11, size as isize),
+            AnnotationCommand::ResizeToolbar(height) => (12, height as isize),
+            AnnotationCommand::Record => (13, 0),
         };
         unsafe {
             let _ = PostMessageW(
@@ -799,6 +833,7 @@ mod windows_overlay {
                         1 => SelectionDecision::Pin,
                         2 => SelectionDecision::Cancel,
                         3 => SelectionDecision::Save,
+                        4 => SelectionDecision::Record,
                         _ => SelectionDecision::Confirm,
                     };
                     if matches!(state.decision, SelectionDecision::Cancel) {
@@ -831,6 +866,21 @@ mod windows_overlay {
                         }
                         1 => state.color = unpack_rgba(lparam.0 as i32),
                         2 => state.stroke_width = (lparam.0 as u32).max(1),
+                        11 => state.font_size = (lparam.0 as u32).max(8),
+                        12 => {
+                            // Resize the toolbar window width to fit the host's
+                            // content (the frontend reports its measured width), then
+                            // re-anchor it at the selection and re-cut the matching
+                            // overlay hole so window, bar, and hole all coincide.
+                            state.toolbar_size.0 = (lparam.0 as u32).max(1);
+                            if let Some(sel) = state.selection {
+                                let tr = toolbar_rect(state, sel);
+                                if let Some(resize) = &state.resize_toolbar {
+                                    resize(tr);
+                                }
+                                set_toolbar_hole(hwnd, state);
+                            }
+                        }
                         3 => {
                             state.doc.undo();
                         }
@@ -853,6 +903,12 @@ mod windows_overlay {
                         8 => {
                             commit_text(state);
                             finish(state, SelectionDecision::Save);
+                            let _ = DestroyWindow(hwnd);
+                            return LRESULT(0);
+                        }
+                        13 => {
+                            commit_text(state);
+                            finish(state, SelectionDecision::Record);
                             let _ = DestroyWindow(hwnd);
                             return LRESULT(0);
                         }
@@ -1006,10 +1062,18 @@ mod windows_overlay {
         }
     }
 
-    /// Where to place the toolbar relative to the selection: below if it fits,
-    /// otherwise above; clamped horizontally to the virtual screen.
+    /// Where to place the toolbar relative to the selection: below if the fully
+    /// expanded toolbar fits, otherwise with the strip just above the selection;
+    /// clamped horizontally to the virtual screen.
+    ///
+    /// The below/above decision uses `expanded_height` (not the current height) so
+    /// the strip's top stays anchored as the options panel opens and closes — only
+    /// the height changes, never `y`.
     fn toolbar_rect(state: &OverlayState, sel: Rect) -> Rect {
         let (tw, th) = state.toolbar_size;
+        // The window can never be wider than the screen; excess content scrolls
+        // horizontally inside the webview.
+        let tw = tw.min(state.virtual_rect.width);
         let vr = state.virtual_rect;
         let screen_right = vr.x + vr.width as i32;
         let screen_bottom = vr.y + vr.height as i32;
@@ -1022,13 +1086,17 @@ mod windows_overlay {
             x = vr.x;
         }
 
-        let mut y = sel.y + sel.height as i32 + TOOLBAR_GAP;
-        if y + th as i32 > screen_bottom {
-            y = sel.y - TOOLBAR_GAP - th as i32;
-            if y < vr.y {
-                y = vr.y;
-            }
-        }
+        // Reserve space for the fully expanded panel when deciding below vs above,
+        // so the strip does not jump when the panel toggles.
+        let expanded = state.expanded_height.max(th) as i32;
+        let y = if sel.y + sel.height as i32 + TOOLBAR_GAP + expanded <= screen_bottom {
+            // Fits below; the panel grows downward into the free margin.
+            sel.y + sel.height as i32 + TOOLBAR_GAP
+        } else {
+            // Not enough room below: anchor the strip just above the selection and
+            // let the panel grow downward over it. Only happens near the bottom edge.
+            (sel.y - TOOLBAR_GAP - state.strip_height as i32).max(vr.y)
+        };
 
         Rect {
             x,
@@ -1132,7 +1200,7 @@ mod windows_overlay {
                 origin,
                 text: state.text_buffer.clone(),
                 color: state.color,
-                font_size: 22,
+                font_size: state.font_size,
             });
         }
         state.text_buffer.clear();
@@ -1246,13 +1314,7 @@ mod windows_overlay {
                 SelectObject(hdc, old_pen);
                 let _ = DeleteObject(HGDIOBJ(pen.0));
             }
-            AnnotationShape::Arrow {
-                start,
-                end,
-                stroke,
-                stroke_width,
-            }
-            | AnnotationShape::Line {
+            AnnotationShape::Line {
                 start,
                 end,
                 stroke,
@@ -1264,6 +1326,31 @@ mod windows_overlay {
                 let old_pen = SelectObject(hdc, HGDIOBJ(pen.0));
                 let _ = MoveToEx(hdc, s.x, s.y, None);
                 let _ = LineTo(hdc, e.x, e.y);
+                SelectObject(hdc, old_pen);
+                let _ = DeleteObject(HGDIOBJ(pen.0));
+            }
+            AnnotationShape::Arrow {
+                start,
+                end,
+                stroke,
+                stroke_width,
+            } => {
+                let s = lp(vr, *start);
+                let e = lp(vr, *end);
+                let pen = CreatePen(PS_SOLID, *stroke_width as i32, colorref(*stroke));
+                let old_pen = SelectObject(hdc, HGDIOBJ(pen.0));
+                let _ = MoveToEx(hdc, s.x, s.y, None);
+                let _ = LineTo(hdc, e.x, e.y);
+                // Arrowhead — same geometry as the rasterizer (arrow_head_wings),
+                // so the live preview matches the pinned/saved image.
+                if let Some((left, right)) = arrow_head_wings(*start, *end, *stroke_width) {
+                    let l = lp(vr, left);
+                    let r = lp(vr, right);
+                    let _ = MoveToEx(hdc, e.x, e.y, None);
+                    let _ = LineTo(hdc, l.x, l.y);
+                    let _ = MoveToEx(hdc, e.x, e.y, None);
+                    let _ = LineTo(hdc, r.x, r.y);
+                }
                 SelectObject(hdc, old_pen);
                 let _ = DeleteObject(HGDIOBJ(pen.0));
             }
