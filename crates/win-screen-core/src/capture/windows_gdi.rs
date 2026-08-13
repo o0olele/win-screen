@@ -115,6 +115,46 @@ impl Drop for SelectedObject {
     }
 }
 
+/// Extract a rectangular region from an existing in-memory DC as a `CapturedImage`.
+/// `offset_x`/`offset_y` are the top-left corner in the DC's local coordinate space
+/// (i.e. screen-absolute minus the DC's own origin). Used by the overlay to read from
+/// the frozen screenshot captured at overlay-start time instead of re-capturing the
+/// live screen at confirmation time.
+pub(crate) fn extract_region_from_dc(
+    src_dc: HDC,
+    offset_x: i32,
+    offset_y: i32,
+    width: u32,
+    height: u32,
+) -> Result<CapturedImage> {
+    if width == 0 || height == 0 {
+        return Err(WinScreenError::InvalidRect(crate::Rect {
+            x: offset_x,
+            y: offset_y,
+            width,
+            height,
+        }));
+    }
+    let w = i32::try_from(width).map_err(|_| WinScreenError::ImageTooLarge)?;
+    let h = i32::try_from(height).map_err(|_| WinScreenError::ImageTooLarge)?;
+
+    let desktop = unsafe { GetDesktopWindow() };
+    let screen_dc = ScreenDc::new(desktop)?;
+    let mem_dc = MemDc::new(screen_dc.hdc)?;
+    let bitmap = Bitmap::new(screen_dc.hdc, w, h)?;
+    let _selected = SelectedObject::new(mem_dc.0, bitmap.0)?;
+
+    // src_dc is an in-memory DC (not the live screen), so CAPTUREBLT is not needed.
+    let copied = unsafe { BitBlt(mem_dc.0, 0, 0, w, h, src_dc, offset_x, offset_y, SRCCOPY) };
+    if copied.is_err() {
+        return Err(WinScreenError::NotImplemented {
+            feature: "BitBlt extract from frozen DC",
+        });
+    }
+
+    bitmap_to_rgba(screen_dc.hdc, bitmap.0, width, height)
+}
+
 pub fn capture_fullscreen() -> Result<CapturedImage> {
     let rect = virtual_screen_rect();
     capture_region(rect)

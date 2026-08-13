@@ -1,7 +1,7 @@
 use crate::{CapturedImage, MonitorInfo, Rect, Result, WinScreenError, WindowInfo};
 
 #[cfg(windows)]
-mod windows_gdi;
+pub(crate) mod windows_gdi;
 
 pub fn capture_fullscreen() -> Result<CapturedImage> {
     #[cfg(windows)]

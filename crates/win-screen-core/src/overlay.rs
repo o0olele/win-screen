@@ -66,13 +66,16 @@ where
     #[cfg(windows)]
     {
         let config = windows_overlay::OverlayConfig::with_decide(Box::new(decide));
-        let Some((rect, decision, _doc)) = windows_overlay::run_overlay(config)? else {
+        let Some((rect, decision, _doc, frozen)) = windows_overlay::run_overlay(config)? else {
             return Ok(None);
         };
         if matches!(decision, SelectionDecision::Cancel) {
             return Ok(None);
         }
-        let image = capture::capture_region(rect)?;
+        let image = match frozen {
+            Some(img) => img,
+            None => capture::capture_region(rect)?,
+        };
         return Ok(Some((rect, image, decision)));
     }
 
@@ -90,13 +93,18 @@ pub fn interactive_capture_selection_with_overlay(
     overlay: InteractiveOverlay,
 ) -> Result<Option<(crate::Rect, CapturedImage, SelectionDecision)>> {
     let config = windows_overlay::OverlayConfig::interactive(overlay);
-    let Some((rect, decision, doc)) = windows_overlay::run_overlay(config)? else {
+    let Some((rect, decision, doc, frozen)) = windows_overlay::run_overlay(config)? else {
         return Ok(None);
     };
     if matches!(decision, SelectionDecision::Cancel) {
         return Ok(None);
     }
-    let image = capture::capture_region(rect)?;
+    // Use the image frozen at overlay-start time; fall back to a live capture only
+    // if extraction from the frozen DC failed (shouldn't happen in practice).
+    let image = match frozen {
+        Some(img) => img,
+        None => capture::capture_region(rect)?,
+    };
     // Annotations are stored in screen-absolute coordinates; map them into the
     // captured region's local space and composite onto the image.
     let image = if doc.is_empty() {
@@ -143,6 +151,7 @@ mod windows_overlay {
         DT_SINGLELINE, DT_VCENTER, HBITMAP, HBRUSH, HDC, HGDIOBJ, HRGN, NULL_BRUSH, PAINTSTRUCT,
         PS_SOLID, RGN_DIFF, SRCCOPY, TRANSPARENT,
     };
+    use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         ReleaseCapture, SetCapture, VK_ESCAPE, VK_RETURN,
@@ -306,7 +315,8 @@ mod windows_overlay {
 
     pub(super) fn run_overlay(
         config: OverlayConfig,
-    ) -> Result<Option<(Rect, SelectionDecision, AnnotationDocument)>> {
+    ) -> Result<Option<(Rect, SelectionDecision, AnnotationDocument, Option<crate::CapturedImage>)>>
+    {
         platform::set_process_dpi_aware().ok();
         let virtual_rect = platform::virtual_screen_rect()?;
         let class_name = wide(CLASS_NAME);
@@ -413,6 +423,26 @@ mod windows_overlay {
             }
         }
 
+        // Extract the frozen screenshot for the selected region BEFORE freeing GDI
+        // resources. This gives us the image captured at overlay-start time rather
+        // than re-capturing the live screen at confirmation time (which would reflect
+        // any video / animation progress since the overlay opened).
+        let frozen_image = state
+            .result
+            .filter(|_| !state.canceled)
+            .and_then(|rect| {
+                let offset_x = rect.x - state.virtual_rect.x;
+                let offset_y = rect.y - state.virtual_rect.y;
+                crate::capture::windows_gdi::extract_region_from_dc(
+                    state.shot_dc,
+                    offset_x,
+                    offset_y,
+                    rect.width,
+                    rect.height,
+                )
+                .ok()
+            });
+
         unsafe {
             SelectObject(state.shot_dc, state.shot_old);
             let _ = DeleteObject(HGDIOBJ(state.shot_bmp.0));
@@ -423,7 +453,7 @@ mod windows_overlay {
             Ok(None)
         } else {
             let doc = std::mem::take(&mut state.doc);
-            Ok(state.result.map(|rect| (rect, state.decision, doc)))
+            Ok(state.result.map(|rect| (rect, state.decision, doc, frozen_image)))
         }
     }
 
@@ -1673,6 +1703,30 @@ mod windows_overlay {
         point
     }
 
+    /// The window's *visible* bounds in physical px. Prefers the DWM extended
+    /// frame bounds (which exclude the invisible resize/drop-shadow border DWM
+    /// adds on the left/right/bottom — the top has none), falling back to the
+    /// raw `GetWindowRect` only when DWM is unavailable. Using the raw rect made
+    /// the hover-highlight a few px larger than the window on every edge but the
+    /// top, so the captured region didn't match the real window.
+    unsafe fn visible_window_rect(hwnd: HWND) -> Option<RECT> {
+        let mut rect = RECT::default();
+        let dwm = DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            &mut rect as *mut RECT as *mut c_void,
+            std::mem::size_of::<RECT>() as u32,
+        );
+        if dwm.is_ok() && rect.right > rect.left && rect.bottom > rect.top {
+            return Some(rect);
+        }
+
+        if GetWindowRect(hwnd, &mut rect).is_ok() {
+            return Some(rect);
+        }
+        None
+    }
+
     unsafe fn window_rect_from_point(overlay_hwnd: HWND, point: POINT) -> Option<Rect> {
         struct HitTest {
             overlay_hwnd: HWND,
@@ -1692,10 +1746,10 @@ mod windows_overlay {
                 return windows::Win32::Foundation::BOOL(1);
             }
 
-            let mut rect = RECT::default();
-            if GetWindowRect(hwnd, &mut rect).is_err() {
-                return windows::Win32::Foundation::BOOL(1);
-            }
+            let rect = match visible_window_rect(hwnd) {
+                Some(r) => r,
+                None => return windows::Win32::Foundation::BOOL(1),
+            };
 
             let width = rect.right - rect.left;
             let height = rect.bottom - rect.top;
